@@ -1,966 +1,705 @@
-import os
-import subprocess
-import math
-import time
-import threading
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone, timedelta, date
+import os, re, json, time, math, socket, platform, subprocess, threading, datetime
+from collections import deque
 import requests
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, request, Response
 
 app = Flask(__name__)
 
-# ==================== 全局核心开关 ====================
-WEEKLY_MODE = False       # False = 📅 当日(0DTE)模式 | True = 📆 全周(WEEKLY 5到期日聚合)模式
-LIVE_FLOW_MODE = True     # True = StrikeGEX动态盘口流向(增量账本稳态版) | False = 传统静态(Call正/Put负)
-NOISE_REDUCTION = True    # True = 过滤远端噪音，聚焦ATM核心博弈区
+CBOE_URLS = {
+    "SPX": "https://cdn.cboe.com/api/global/delayed_quotes/options/_SPX.json",
+    "XSP": "https://cdn.cboe.com/api/global/delayed_quotes/options/_XSP.json",
+    "SPY": "https://cdn.cboe.com/api/global/delayed_quotes/options/SPY.json",
+    "QQQ": "https://cdn.cboe.com/api/global/delayed_quotes/options/QQQ.json",
+}
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Accept": "application/json"}
+OPT_REGEX = re.compile(r"^([A-Z_]+?)(\d{6})([CP])(\d{8})$")
+CACHE_FILE = "gex_auto_cache.json"
+ROLLING_HISTORY = deque(maxlen=60)
+BG_STARTED = False
+BG_LOCK = threading.Lock()
 
-TICKERS = {
-    "SPX": {"cboe": "_SPX", "yf": "^GSPC", "step": 5.0},
-    "XSP": {"cboe": "_XSP", "yf": "^XSP",  "step": 1.0},
-    "SPY": {"cboe": "SPY",  "yf": "SPY",   "step": 1.0},
-    "QQQ": {"cboe": "QQQ",  "yf": "QQQ",   "step": 1.0},
+STATE = {
+    "mode": "next",
+    "available_exps": [],
+    "skew_adj": False,
+    "last_update": "正在同步毫秒级实时点位与 CBOE 期权链...",
+    "baseline_time": "自动锚定中...",
+    "rolling_time": "积累滑动窗口中...",
+    "trading_day": "",
+    "rth_locked": False,
+    "public_url": "云端24小时实时运行中",
+    "lan_url": "",
+    "live_spots": {},
+    "baseline_data": {},
+    "current_data": {},
+    "alerts": [],
+    "xsp_advice": {}
 }
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Cache-Control": "no-cache",
-}
+def is_cloud_env():
+    return bool(os.environ.get("RENDER") or os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("PORT"))
 
-# ==================== 内存持久化状态池 (防闪烁/防回退/秒切周日模式) ====================
-RAW_CHAIN_CACHE = {}      # 缓存经过防倒退校验的CBOE期权链 (含未来5个到期日全周数据)
-CHAIN_VOL_STAMP = {}      # 记录每个标的最大累计成交量，拦截落后的CDN旧节点
-FLOW_LEDGER = {}          # 增量订单流账本: {opt_sym: {"vol": float, "signed_vol": float}}
-EMA_GEX_CACHE = {}        # 行权价级别EMA平滑缓存
-SPOT_CACHE = {}           # 持久化最新实时现价(永不回退15分钟延迟价)
-RENDER_CACHE = {}         # 前端秒读缓存
-BASELINE_MEMORY = {}      # 破位与小火箭预警记忆
-LAST_UPDATE_STR = "同步中..."
-CACHE_LOCK = threading.Lock()
+def get_est_now():
+    return datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=5)
 
-
-# ==================== 0. 启动自检：自动清理占用5000端口的旧幽灵进程 ====================
-def kill_stale_port_5000():
-    if os.name != "nt":
-        return
-    my_pid = os.getpid()
+def fetch_realtime_spots():
+    spots = {}
+    ts = int(time.time() * 1000)
     try:
-        out = subprocess.check_output("netstat -ano | findstr :5000", shell=True, text=True)
-        killed = set()
-        for line in out.strip().splitlines():
-            parts = line.split()
-            if len(parts) >= 5 and "LISTENING" in parts:
-                pid = int(parts[-1])
-                if pid != my_pid and pid > 0 and pid not in killed:
-                    subprocess.run(f"taskkill /F /PID {pid}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    killed.add(pid)
-        if killed:
-            print(f"🧹 已自动清理后台残留的旧端口进程 PID: {killed}，防止双进程画面闪烁！")
-            time.sleep(0.5)
+        cnbc_url = f"https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol?symbols=.SPX%7C.XSP%7CSPY%7CQQQ&requestMethod=itv&noform=1&partnerId=2&fund=1&exthrs=1&output=json&_={ts}"
+        r = requests.get(cnbc_url, headers=HEADERS, timeout=4)
+        q_list = r.json().get("FormattedQuoteResult", {}).get("FormattedQuote", [])
+        if isinstance(q_list, dict): q_list = [q_list]
+        sym_map = {".SPX": "SPX", ".XSP": "XSP", "SPY": "SPY", "QQQ": "QQQ"}
+        est = get_est_now()
+        is_rth = (est.hour > 9 or (est.hour == 9 and est.minute >= 30)) and (est.hour < 16)
+        for q in q_list:
+            tk = sym_map.get(q.get("symbol"))
+            if not tk: continue
+            raw_p = q.get("last")
+            if not is_rth and q.get("ExtendedMktQuote", {}).get("last"):
+                raw_p = q["ExtendedMktQuote"]["last"]
+            if raw_p:
+                val = float(str(raw_p).replace(",", ""))
+                if val > 0: spots[tk] = val
     except Exception:
         pass
 
-
-def get_us_eastern_now():
-    return datetime.now(timezone.utc) - timedelta(hours=5)
-
-
-def yymmdd_to_days_diff(yymmdd_str, today_date):
-    try:
-        y = 2000 + int(yymmdd_str[0:2])
-        m = int(yymmdd_str[2:4])
-        d = int(yymmdd_str[4:6])
-        return max(0, (date(y, m, d) - today_date).days)
-    except Exception:
-        return 1
-
-
-# ==================== 1. 实时现价抓取 (带持久化防回退锁) ====================
-def fetch_single_spot(key, yf_sym):
-    try:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yf_sym}?interval=1m&range=1d"
-        r = requests.get(url, headers=HEADERS, timeout=2.5)
-        if r.status_code == 200:
-            meta = r.json()["chart"]["result"][0]["meta"]
-            price = float(meta.get("regularMarketPrice") or meta.get("previousClose") or 0)
-            prev = float(meta.get("chartPreviousClose") or meta.get("previousClose") or price)
-            if price > 0:
-                pct = ((price - prev) / prev * 100.0) if prev > 0 else 0.0
-                return key, price, pct
-    except Exception:
-        pass
-    return key, None, None
-
-
-def update_all_spots():
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        futures = [ex.submit(fetch_single_spot, k, cfg["yf"]) for k, cfg in TICKERS.items()]
-        for f in futures:
-            k, price, pct = f.result()
-            if price and price > 0:
-                SPOT_CACHE[k] = {"spot": price, "pct": pct}
-
-    if "SPX" in SPOT_CACHE and "XSP" not in SPOT_CACHE:
-        SPOT_CACHE["XSP"] = {"spot": round(SPOT_CACHE["SPX"]["spot"] / 10.0, 2), "pct": SPOT_CACHE["SPX"]["pct"]}
-    elif "XSP" in SPOT_CACHE and "SPX" not in SPOT_CACHE:
-        SPOT_CACHE["SPX"] = {"spot": round(SPOT_CACHE["XSP"]["spot"] * 10.0, 2), "pct": SPOT_CACHE["XSP"]["pct"]}
-
-
-# ==================== 2. Black-Scholes Gamma 补偿 ====================
-def bs_live_gamma(spot, strike, iv, t_years):
-    if spot <= 0 or strike <= 0 or iv <= 0 or t_years <= 0:
-        return 0.0
-    try:
-        sqrt_t = math.sqrt(t_years)
-        d1 = (math.log(spot / strike) + 0.5 * (iv * iv) * t_years) / (iv * sqrt_t)
-        pdf_d1 = math.exp(-0.5 * (d1 * d1)) * 0.3989422804
-        return pdf_d1 / (spot * iv * sqrt_t)
-    except Exception:
-        return 0.0
-
-
-# ==================== 3. CBOE 期权链拉取 (预缓存未来5个到期日以支持周/日秒切) ====================
-def fetch_cboe_raw_chain(ticker_key):
-    cfg = TICKERS[ticker_key]
-    cboe_sym = cfg["cboe"]
-    ts_bucket = int(time.time() // 5)
-    urls = [
-        f"https://cdn.cboe.com/api/global/delayed_quotes/options/{cboe_sym}.json?_={ts_bucket}",
-        f"https://cdn.cboe.com/api/global/delayed_quotes/options/{cboe_sym.replace('_', '')}.json?_={ts_bucket}",
-    ]
-
-    raw_json = None
-    for url in urls:
+    yf_map = {"SPX": "^GSPC", "XSP": "^XSP", "SPY": "SPY", "QQQ": "QQQ"}
+    for tk, sym in yf_map.items():
+        if tk in spots and spots[tk] > 0: continue
         try:
-            r = requests.get(url, headers=HEADERS, timeout=(2.5, 4.5))
-            if r.status_code == 200:
-                raw_json = r.json()
-                break
+            u = f"https://query2.finance.yahoo.com/v8/finance/chart/{sym}?interval=1m&range=1d&includePrePost=true&_={ts}"
+            r = requests.get(u, headers=HEADERS, timeout=4)
+            res = r.json().get("chart", {}).get("result", [])
+            if not res: continue
+            meta = res[0].get("meta", {})
+            reg_p = float(meta.get("regularMarketPrice") or 0)
+            closes = res[0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
+            valid_c = [float(c) for c in closes if c is not None and c > 0]
+            est = get_est_now()
+            is_rth = (est.hour > 9 or (est.hour == 9 and est.minute >= 30)) and (est.hour < 16)
+            if is_rth and reg_p > 0:
+                spots[tk] = reg_p
+            elif valid_c:
+                spots[tk] = valid_c[-1]
+            elif reg_p > 0:
+                spots[tk] = reg_p
         except Exception:
-            continue
+            pass
 
-    if not raw_json or "data" not in raw_json:
-        return False
+    if "SPX" in spots and "XSP" not in spots:
+        spots["XSP"] = round(spots["SPX"] / 10.0, 2)
+    elif "XSP" in spots and "SPX" not in spots:
+        spots["SPX"] = round(spots["XSP"] * 10.0, 2)
 
-    data_block = raw_json["data"]
-    cboe_spot = float(data_block.get("current_price") or 0)
-    if ticker_key not in SPOT_CACHE and cboe_spot > 0:
-        SPOT_CACHE[ticker_key] = {"spot": cboe_spot, "pct": 0.0}
+    if spots:
+        STATE["live_spots"] = spots
+    return STATE["live_spots"]
 
-    spot = SPOT_CACHE.get(ticker_key, {}).get("spot") or cboe_spot
-    if spot <= 0:
-        return False
+def get_lan_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return f"http://{ip}:5050"
+    except Exception:
+        return "http://127.0.0.1:5050"
 
-    options = data_block.get("options", [])
-    if not options:
-        return False
+def generate_cloud_24h_package():
+    if is_cloud_env(): return
+    cloud_dir = "cloud_24h_deploy"
+    try:
+        os.makedirs(cloud_dir, exist_ok=True)
+        old_docker = os.path.join(cloud_dir, "Dockerfile")
+        if os.path.exists(old_docker): os.remove(old_docker)
+        with open(__file__, "r", encoding="utf-8") as f:
+            self_code = f.read()
+        with open(os.path.join(cloud_dir, "app.py"), "w", encoding="utf-8") as f:
+            f.write(self_code)
+        with open(os.path.join(cloud_dir, "requirements.txt"), "w", encoding="utf-8") as f:
+            f.write("flask>=3.0.0\nrequests>=2.31.0\ngunicorn>=21.2.0\n")
+        print(f"☁️ 已自动同步更新 Render.com 部署文件至: ./{cloud_dir}/ (app.py, requirements.txt)")
+    except Exception as e:
+        print(f"[Cloud Sync Warn] {e}")
 
-    est_now = get_us_eastern_now()
-    today_yymmdd = est_now.strftime("%y%m%d")
-    max_dist = spot * 0.065
-
-    filtered_opts = []
-    avail_dates = set()
-    total_chain_vol = 0.0
-
-    for opt in options:
-        sym = opt.get("option", "")
-        if len(sym) < 16:
-            continue
-        opt_type = sym[-9]
-        if opt_type not in ("C", "P"):
-            continue
-        yymmdd = sym[-15:-9]
-        if yymmdd < today_yymmdd:
-            continue
+def start_public_tunnel():
+    ext_url = os.environ.get("RENDER_EXTERNAL_URL")
+    if is_cloud_env():
+        STATE["public_url"] = ext_url or "Render云端24小时实时运行中"
+        return
+    STATE["lan_url"] = get_lan_ip()
+    is_win = platform.system().lower().startswith("win")
+    bin_name = "cloudflared.exe" if is_win else "cloudflared"
+    if not os.path.exists(bin_name):
         try:
-            strike = int(sym[-8:]) * 0.001
-        except ValueError:
-            continue
+            dl_url = (
+                "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+                if is_win else
+                "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+            )
+            r = requests.get(dl_url, stream=True, timeout=60)
+            with open(bin_name, "wb") as f:
+                for chunk in r.iter_content(chunk_size=65536):
+                    if chunk: f.write(chunk)
+            if not is_win: os.chmod(bin_name, 0o755)
+        except Exception:
+            STATE["public_url"] = STATE["lan_url"]
+            return
+    try:
+        cmd = [bin_name if is_win else f"./{bin_name}", "tunnel", "--url", "http://127.0.0.1:5050"]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="ignore")
+        url_pat = re.compile(r"(https://[a-zA-Z0-9\-]+\.trycloudflare\.com)")
+        for line in proc.stdout:
+            m = url_pat.search(line)
+            if m:
+                STATE["public_url"] = m.group(1)
+                print(f"\n📱 本机临时手机公网网址: {STATE['public_url']}\n")
+                break
+    except Exception:
+        STATE["public_url"] = STATE["lan_url"]
 
-        if abs(strike - spot) > max_dist:
-            continue
+def save_baseline_cache():
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump({
+                "trading_day": STATE["trading_day"], "rth_locked": STATE["rth_locked"],
+                "baseline_time": STATE["baseline_time"], "baseline_data": STATE["baseline_data"]
+            }, f)
+    except Exception:
+        pass
 
-        vol = float(opt.get("volume", 0) or 0)
-        total_chain_vol += vol
-        avail_dates.add(yymmdd)
-        filtered_opts.append((sym, yymmdd, opt_type, strike, opt))
+def load_baseline_cache():
+    if not os.path.exists(CACHE_FILE): return
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        est_today = get_est_now().strftime("%Y-%m-%d")
+        if data.get("trading_day") == est_today and data.get("baseline_data"):
+            b_data = data["baseline_data"]
+            for tk, item in b_data.items():
+                if "strike_map" in item:
+                    item["strike_map"] = {float(k): float(v) for k, v in item["strike_map"].items()}
+            STATE.update({
+                "trading_day": est_today, "rth_locked": bool(data.get("rth_locked", False)),
+                "baseline_time": data.get("baseline_time", "已恢复"), "baseline_data": b_data
+            })
+    except Exception:
+        pass
 
-    if not avail_dates:
-        return False
+def bs_live_gamma(spot, strike, iv, t_years):
+    sigma = iv if (iv and 0.04 < iv < 2.5) else 0.16
+    if spot <= 0 or strike <= 0 or t_years <= 0:
+        return 0.0
+    sqrt_t = math.sqrt(t_years)
+    d1 = (math.log(spot / strike) + 0.5 * (sigma ** 2) * t_years) / (sigma * sqrt_t)
+    if abs(d1) > 6.0:
+        return 0.0
+    pdf_d1 = math.exp(-0.5 * (d1 ** 2)) / math.sqrt(2.0 * math.pi)
+    return pdf_d1 / (spot * sigma * sqrt_t)
 
-    # 🔒 CDN 边缘节点防倒退锁
-    prev_max_vol = CHAIN_VOL_STAMP.get(ticker_key, 0.0)
-    if total_chain_vol < prev_max_vol * 0.998 and ticker_key in RAW_CHAIN_CACHE:
-        return True
-    CHAIN_VOL_STAMP[ticker_key] = max(prev_max_vol, total_chain_vol)
+def fetch_cboe_gex(ticker, url, strike_step, mode="next", skew_adj=False, live_spots=None, num_strikes=30):
+    ts = int(time.time() * 1000)
+    sep = "&" if "?" in url else "?"
+    resp = requests.get(f"{url}{sep}_={ts}", headers=HEADERS, timeout=12)
+    resp.raise_for_status()
+    payload = resp.json().get("data", {})
+    cboe_delayed_spot = float(payload.get("current_price") or payload.get("close") or 0)
+    options = payload.get("options", [])
+    if cboe_delayed_spot <= 0 or not options:
+        raise ValueError(f"{ticker} 数据为空")
 
-    sorted_dates = sorted(list(avail_dates))
-    target_d = sorted_dates[0]
-    next_d = sorted_dates[1] if len(sorted_dates) > 1 else target_d
-    # 截取未来最多 5 个到期日 (涵盖当周全部交易日及周五OPEX)
-    week_dates = sorted_dates[:5]
-    week_dates_set = set(week_dates)
+    spot = cboe_delayed_spot
+    if live_spots and ticker in live_spots and live_spots[ticker] > 0:
+        spot = live_spots[ticker]
 
-    week_opts = [item for item in filtered_opts if item[1] in week_dates_set]
+    est_now = get_est_now()
+    today_str = est_now.strftime("%y%m%d")
+    # 美东时间 16:00 收盘后（或周末），强制判定今日 0DTE 已过期，自动跳至下一交易日
+    is_after_close = (est_now.hour >= 16) or (est_now.weekday() >= 5)
 
-    # 更新全周期权增量订单流账本
-    update_flow_ledger(week_opts, spot)
+    all_exps = sorted({
+        m.group(2) for opt in options
+        if (m := OPT_REGEX.match(opt.get("option", ""))) and m.group(2) >= today_str
+    })
+    if not all_exps:
+        all_exps = sorted({m.group(2) for opt in options if (m := OPT_REGEX.match(opt.get("option", "")))})[-5:]
 
-    first_lbl = f"{target_d[2:4]}-{target_d[4:6]}"
-    last_d = week_dates[-1]
-    last_lbl = f"{last_d[2:4]}-{last_d[4:6]}"
+    valid_exps = [e for e in all_exps if not (is_after_close and e <= today_str)] or all_exps
 
-    RAW_CHAIN_CACHE[ticker_key] = {
-        "cboe_spot": cboe_spot,
-        "target_d": target_d,
-        "next_d": next_d,
-        "week_dates": week_dates,
-        "day_label": f"{first_lbl} 0DTE",
-        "week_label": f"{first_lbl}~{last_lbl} 周" if last_d != target_d else f"{first_lbl} 周",
-        "week_opts": week_opts,
-    }
-    return True
+    if ticker == "SPX":
+        STATE["available_exps"] = all_exps[:10]
 
+    if mode == "weekly":
+        target_exps = set(valid_exps[:5])
+        exp_label = f"全周({len(target_exps)}期)"
+    elif mode in all_exps:
+        target_exps = {mode}
+        exp_label = f"{mode[2:4]}-{mode[4:]}"
+    else:
+        target_exps = {valid_exps[0]}
+        e0 = valid_exps[0]
+        exp_label = f"{e0[2:4]}-{e0[4:]}"
 
-# ==================== 4. 增量订单流账本 ====================
-def calc_contract_flow_sign(opt_type, strike, spot, opt):
-    static_sign = 1.0 if opt_type == "C" else -1.0
-    bid = float(opt.get("bid", 0) or 0)
-    ask = float(opt.get("ask", 0) or 0)
-    last_p = float(opt.get("last_trade_price", 0) or 0)
-    prev_close = float(opt.get("prev_day_close", 0) or 0)
+    chain_group = {}
+    for opt in options:
+        m = OPT_REGEX.match(opt.get("option", ""))
+        if not m or m.group(2) not in target_exps: continue
+        exp_str, opt_type = m.group(2), m.group(3)
+        strike = int(m.group(4)) / 1000.0
+        if strike_step >= 5 and (strike % 5 != 0): continue
 
-    quote_sign = static_sign
-    if ask > bid and bid > 0 and last_p > 0:
-        spread = max(ask - bid, 0.01)
-        ask_pos = max(0.0, min(1.0, (last_p - bid) / spread))
-        quote_sign = 1.0 - 2.0 * ask_pos
-
-    mom_sign = static_sign
-    if last_p > 0 and prev_close > 0:
-        chg = (last_p - prev_close) / max(prev_close, 0.05)
-        if chg > 0.12:
-            mom_sign = -0.85
-        elif chg < -0.12:
-            mom_sign = 0.85
-
-    return 0.60 * mom_sign + 0.40 * quote_sign
-
-
-def update_flow_ledger(week_opts, spot):
-    for sym, yymmdd, opt_type, strike, opt in week_opts:
-        vol = float(opt.get("volume", 0) or 0)
-        cur_sign = calc_contract_flow_sign(opt_type, strike, spot, opt)
-
-        rec = FLOW_LEDGER.get(sym)
-        if rec is None:
-            FLOW_LEDGER[sym] = {
-                "vol": vol,
-                "signed_vol": vol * cur_sign,
+        key = (exp_str, strike)
+        if key not in chain_group:
+            chain_group[key] = {
+                "C_oi": 0.0, "C_vol": 0.0, "C_g": 0.0, "C_iv": 0.0,
+                "P_oi": 0.0, "P_vol": 0.0, "P_g": 0.0, "P_iv": 0.0
             }
+        rg, riv = float(opt.get("gamma") or 0.0), float(opt.get("iv") or 0.0)
+        chain_group[key][f"{opt_type}_oi"] += float(opt.get("open_interest") or 0.0)
+        chain_group[key][f"{opt_type}_vol"] += float(opt.get("volume") or 0.0)
+        if rg > 0: chain_group[key][f"{opt_type}_g"] = rg
+        if riv > 0: chain_group[key][f"{opt_type}_iv"] = riv
+
+    strike_map = {}
+    for (exp_str, strike), d in chain_group.items():
+        exp_dt = datetime.datetime.strptime("20" + exp_str, "%Y%m%d").date()
+        days_diff = (exp_dt - est_now.date()).days
+        if days_diff <= 0:
+            close_dt = est_now.replace(hour=16, minute=0, second=0, microsecond=0)
+            rem_hours = max((close_dt - est_now).total_seconds() / 3600.0, 0.40)
+            t_years = rem_hours / (252.0 * 6.5)
         else:
-            delta_vol = vol - rec["vol"]
-            if delta_vol > 0:
-                rec["signed_vol"] += delta_vol * cur_sign
-                rec["vol"] = vol
-            else:
-                rec["signed_vol"] = 0.97 * rec["signed_vol"] + 0.03 * (vol * cur_sign)
+            t_years = (days_diff + 0.5) / 252.0
 
+        ref_iv = (d["C_iv"] or d["P_iv"]) if strike >= spot else (d["P_iv"] or d["C_iv"])
+        live_g = bs_live_gamma(spot, strike, ref_iv, t_years)
+        cboe_g = (d["C_g"] or d["P_g"]) if strike >= spot else (d["P_g"] or d["C_g"])
+        unit_gamma = live_g if live_g > 0 else cboe_g
 
-# ==================== 5. 内存级 GEX 计算引擎 (支持当日/全周双模秒切) ====================
-def compute_ticker_gex(ticker_key, use_ema=True):
-    raw = RAW_CHAIN_CACHE.get(ticker_key)
-    if not raw:
-        return None
+        c_oi, p_oi = d["C_oi"], d["P_oi"]
+        if skew_adj:
+            p_oi = p_oi * 0.75
+        net_oi = c_oi - p_oi
 
-    cfg = TICKERS[ticker_key]
-    step = cfg["step"]
-    live_info = SPOT_CACHE.get(ticker_key, {})
-    spot = live_info.get("spot") or raw["cboe_spot"]
-    pct_change = live_info.get("pct", 0.0)
-    if spot <= 0:
-        return None
+        gex_m = unit_gamma * net_oi * 100.0 * spot / 1e6
+        strike_map[strike] = strike_map.get(strike, 0.0) + gex_m
 
-    target_d = raw["target_d"]
-    next_d = raw["next_d"]
-    est_now = get_us_eastern_now()
-    today_date = est_now.date()
-    hours_left = max(1.0, (16 - est_now.hour) + (15 - est_now.minute) / 60.0) if est_now.hour < 16 else 4.0
-    t_0dte = max(hours_left / (252.0 * 6.5), 1.0 / (252.0 * 24.0))
+    all_strikes = sorted(strike_map.keys())
+    atm = min(all_strikes, key=lambda k: abs(k - spot)) if all_strikes else round(spot / strike_step) * strike_step
+    sel = sorted([k for k in all_strikes if abs(k - atm) <= strike_step * (num_strikes // 2)], reverse=True)
 
-    strike_buckets = {}
-    vol_weight = 1.35 if NOISE_REDUCTION else 0.75
+    pos = {k: strike_map[k] for k in sel if strike_map[k] > 0.001}
+    neg = {k: strike_map[k] for k in sel if strike_map[k] < -0.001}
+    max_pos = max(pos, key=pos.get) if pos else atm
+    max_neg = min(neg, key=neg.get) if neg else atm
+    king = max(sel, key=lambda k: abs(strike_map[k])) if sel else atm
 
-    for sym, yymmdd, opt_type, strike, opt in raw["week_opts"]:
-        # ==================== 当日 (0DTE) vs 全周 (WEEKLY) 过滤与权重 ====================
-        if not WEEKLY_MODE:
-            # 📅 当日模式：仅聚焦当日0DTE与次日近端缓冲
-            if yymmdd not in (target_d, next_d):
-                continue
-            date_factor = 1.0 if yymmdd == target_d else 0.25
-        else:
-            # 📆 全周模式：聚合当周全部 5 个到期日，按到期远近温和赋权
-            days_diff = yymmdd_to_days_diff(yymmdd, today_date)
-            date_factor = 1.0 if days_diff == 0 else max(0.55, 0.92 ** days_diff)
+    up_pos = {k: v for k, v in pos.items() if k >= spot}
+    dn_pos = {k: v for k, v in pos.items() if k < spot}
+    dn_neg = {k: v for k, v in neg.items() if k <= spot}
 
-        grid_strike = round(round(strike / step) * step, 2)
+    cw = max(up_pos, key=up_pos.get) if up_pos else max([k for k in sel if k >= spot], default=atm)
+    below_cands = [k for k in sel if k <= spot - strike_step]
+    pw = max(dn_pos, key=dn_pos.get) if dn_pos else (max(below_cands, key=lambda k: strike_map[k]) if below_cands else atm - strike_step * 2)
+    pt = min(dn_neg, key=dn_neg.get) if dn_neg else max_neg
 
-        oi = float(opt.get("open_interest", 0) or 0)
-        vol = float(opt.get("volume", 0) or 0)
-        iv = float(opt.get("iv", 0) or 0.18)
-        if iv > 3.0:
-            iv = iv * 0.01
-        raw_gamma = float(opt.get("gamma", 0) or 0)
-
-        if yymmdd == target_d:
-            t_exp = t_0dte
-        else:
-            days_diff = max(1, yymmdd_to_days_diff(yymmdd, today_date))
-            t_exp = t_0dte + (days_diff / 252.0)
-
-        gamma = bs_live_gamma(spot, strike, max(iv, 0.05), t_exp) if raw_gamma <= 1e-6 else raw_gamma
-
-        # 标准单点美元 Gamma ($M)
-        unit_gex = gamma * spot * 0.000001 * date_factor
-        static_sign = 1.0 if opt_type == "C" else -1.0
-
-        if not LIVE_FLOW_MODE:
-            eff_qty = oi + vol * vol_weight
-            gex_m = unit_gex * eff_qty * static_sign
-            flow_score = static_sign * vol
-        else:
-            # 全周模式下隔夜 OI 底仓权重更高(0.65)，当日模式下日内订单流权重更高(0.40)
-            base_oi_keep = 0.60 if WEEKLY_MODE else 0.40
-            oi_keep = base_oi_keep if NOISE_REDUCTION else (base_oi_keep + 0.20)
-            oi_gex = unit_gex * (oi * oi_keep) * static_sign
-
-            ledger_rec = FLOW_LEDGER.get(sym)
-            signed_vol = ledger_rec["signed_vol"] if ledger_rec else (vol * static_sign)
-
-            dist_pct = abs(strike - spot) / spot
-            flow_boost = 1.85 if dist_pct <= 0.018 else 1.15
-            vol_gex = unit_gex * (signed_vol * vol_weight * flow_boost)
-
-            gex_m = oi_gex + vol_gex
-            flow_score = signed_vol
-
-        b = strike_buckets.get(grid_strike)
-        if b is None:
-            b = {
-                "strike": grid_strike, "net_gex": 0.0,
-                "call_oi": 0, "put_oi": 0, "call_vol": 0, "put_vol": 0,
-                "flow_weighted": 0.0, "vol_total": 0.0,
-            }
-            strike_buckets[grid_strike] = b
-
-        b["net_gex"] += gex_m
-        b["flow_weighted"] += flow_score
-        b["vol_total"] += vol
-        if opt_type == "C":
-            b["call_oi"] += int(oi)
-            b["call_vol"] += int(vol)
-        else:
-            b["put_oi"] += int(oi)
-            b["put_vol"] += int(vol)
-
-    center_strike = round(round(spot / step) * step, 2)
-    ladder_strikes = [round(center_strike + i * step, 2) for i in range(12, -13, -1)]
+    flip = atm
+    for i in range(len(sel) - 1):
+        k1, k2 = sel[i], sel[i + 1]
+        if (strike_map[k1] >= 0) != (strike_map[k2] >= 0):
+            if abs(k1 - spot) < abs(flip - spot) or flip == atm:
+                flip = k1
 
     rows = []
-    for s in ladder_strikes:
-        b = strike_buckets.get(s)
-        raw_val = b["net_gex"] if b else 0.0
+    mp_val = pos.get(max_pos, 1.0) or 1.0
+    mn_val = abs(neg.get(max_neg, -1.0)) or 1.0
 
-        # 独立 EMA 键（包含 WEEKLY_MODE，确保日/周切换互不干扰）
-        ema_key = (ticker_key, s, WEEKLY_MODE, LIVE_FLOW_MODE, NOISE_REDUCTION)
-        if use_ema and ema_key in EMA_GEX_CACHE:
-            smoothed_val = 0.75 * EMA_GEX_CACHE[ema_key] + 0.25 * raw_val
-        else:
-            smoothed_val = raw_val
-        EMA_GEX_CACHE[ema_key] = smoothed_val
-
-        if b:
-            avg_flow = (b["flow_weighted"] / b["vol_total"]) if b["vol_total"] > 0 else 0.0
-            rows.append({
-                "strike": s, "net_gex": smoothed_val,
-                "call_oi": b["call_oi"], "put_oi": b["put_oi"],
-                "call_vol": b["call_vol"], "put_vol": b["put_vol"],
-                "avg_flow": round(avg_flow, 2),
-            })
-        else:
-            rows.append({
-                "strike": s, "net_gex": 0.0,
-                "call_oi": 0, "put_oi": 0, "call_vol": 0, "put_vol": 0, "avg_flow": 0.0,
-            })
-
-    pos_rows = [r for r in rows if r["net_gex"] > 0]
-    neg_rows = [r for r in rows if r["net_gex"] < 0]
-
-    call_wall = max(pos_rows, key=lambda x: x["net_gex"])["strike"] if pos_rows else center_strike + step * 3
-    put_wall = min(neg_rows, key=lambda x: x["net_gex"])["strike"] if neg_rows else center_strike - step * 3
-    king_node = max(rows, key=lambda x: abs(x["net_gex"]))["strike"] if rows else center_strike
-
-    max_pos_val = max((r["net_gex"] for r in pos_rows), default=0.0)
-    min_neg_val = min((r["net_gex"] for r in neg_rows), default=0.0)
-
-    zero_flip = center_strike
-    min_diff = 1e9
-    for i in range(len(rows) - 1):
-        g1, g2 = rows[i]["net_gex"], rows[i + 1]["net_gex"]
-        if (g1 >= 0 and g2 < 0) or (g1 < 0 and g2 >= 0):
-            cand = rows[i]["strike"] if abs(g1) < abs(g2) else rows[i + 1]["strike"]
-            if abs(cand - spot) < min_diff:
-                min_diff = abs(cand - spot)
-                zero_flip = cand
-
-    sorted_by_abs = sorted(rows, key=lambda x: abs(x["net_gex"]), reverse=True)
-    star_strikes = {r["strike"] for r in sorted_by_abs[:3] if abs(r["net_gex"]) > 0}
-    max_abs_gex = max((abs(r["net_gex"]) for r in rows), default=1.0) or 1.0
-
-    for r in rows:
-        s = r["strike"]
-        r["is_spot"] = (abs(s - center_strike) < 1e-4)
-        r["is_king"] = (abs(s - king_node) < 1e-4)
-        r["is_call_wall"] = (abs(s - call_wall) < 1e-4)
-        r["is_put_wall"] = (abs(s - put_wall) < 1e-4)
-        r["is_flip"] = (abs(s - zero_flip) < 1e-4)
-        r["is_star"] = (s in star_strikes)
-        r["intensity"] = round(min(1.0, abs(r["net_gex"]) / max_abs_gex), 3)
-
-    alerts = []
-    base_key = (ticker_key, WEEKLY_MODE)
-    prev_state = BASELINE_MEMORY.get(base_key)
-    mode_tag = "全周" if WEEKLY_MODE else "日内"
-    if prev_state:
-        if call_wall > prev_state["call_wall"] and spot > prev_state["spot"]:
-            alerts.append(f"🚀 {ticker_key} ({mode_tag}) 小火箭逼空：正Gamma阻力墙上移至 {call_wall}！")
-        if spot < prev_state["put_wall"] and prev_state["spot"] >= prev_state["put_wall"]:
-            alerts.append(f"⚠️ {ticker_key} ({mode_tag}) 破位警报：跌穿 {prev_state['put_wall']} 负Gamma触发位！")
-
-    BASELINE_MEMORY[base_key] = {"spot": spot, "call_wall": call_wall, "put_wall": put_wall}
+    for k in sel:
+        v = strike_map[k]
+        b = [sym for cond, sym in [(k == king, "👑"), (k == cw, "▲"), (k == pt, "▼"), (k == flip, "◆"), (k == atm, "M")] if cond]
+        r = (v / mp_val) if v >= 0 else (abs(v) / mn_val)
+        cls = ("gex-king-pos" if r >= 0.65 else ("gex-mid-pos" if r >= 0.25 else "gex-low-pos")) if v >= 0 else ("gex-king-neg" if r >= 0.65 else ("gex-mid-neg" if r >= 0.25 else "gex-low-neg"))
+        star = "*" if (k == max_pos or k == max_neg) else ""
+        av = abs(v)
+        v_str = f"{'+' if v >= 0 else '-'}${av:.1f}M{star}" if av >= 1.0 else f"{'+' if v >= 0 else '-'}${av*1000:.0f}K{star}"
+        xsp_eq = k / 10.0 if ticker == "SPX" else k
+        pos_rel = "above" if k > spot + strike_step * 0.3 else ("below" if k < spot - strike_step * 0.3 else "at")
+        rows.append({
+            "strike": f"{k:.0f}" if strike_step >= 5 else f"{k:.1f}" if ticker == "XSP" else f"{k:.0f}",
+            "raw_strike": k, "xsp_eq": f"{xsp_eq:.1f}", "pos_rel": pos_rel,
+            "gex": round(v, 2), "gex_str": v_str, "badges": b, "color_cls": cls, "is_spot": k == atm
+        })
 
     return {
-        "ticker": ticker_key,
-        "exp": raw["week_label"] if WEEKLY_MODE else raw["day_label"],
-        "spot": spot,
-        "pct_change": pct_change,
-        "zero_flip": zero_flip,
-        "call_wall": call_wall,
-        "put_wall": put_wall,
-        "king_node": king_node,
-        "max_pos_val": max_pos_val,
-        "min_neg_val": min_neg_val,
-        "rows": rows,
-        "alerts": alerts,
+        "ticker": ticker, "spot": spot, "cboe_delayed": cboe_delayed_spot, "exp": exp_label, "atm_strike": atm,
+        "call_wall": cw, "put_wall": pw, "put_trigger": pt, "flip_strike": flip,
+        "strike_map": strike_map, "rows": rows
     }
 
+def check_reference_shifts(curr, ref_data, ref_label, alerts_dict):
+    if not ref_data or "SPX" not in ref_data or "SPX" not in curr: return
+    spx, xsp, b_spx = curr["SPX"], curr.get("XSP"), ref_data["SPX"]
+    spot, cw, pw, pt, flip = spx["spot"], spx["call_wall"], spx["put_wall"], spx["put_trigger"], spx["flip_strike"]
+    xsp_spot = spot / 10.0
+    if spx["strike_map"].get(pw, 0) <= 0 and xsp and xsp["strike_map"].get(xsp["put_wall"], 0) > 0:
+        pw = xsp["put_wall"] * 10.0
 
-def rebuild_render_cache(use_ema=True):
-    global LAST_UPDATE_STR
-    new_render = {}
-    for k in ["SPX", "XSP", "SPY", "QQQ"]:
-        res = compute_ticker_gex(k, use_ema=use_ema)
-        if res:
-            new_render[k] = res
-        elif k in RENDER_CACHE:
-            new_render[k] = RENDER_CACHE[k]
-    with CACHE_LOCK:
-        RENDER_CACHE.update(new_render)
-        LAST_UPDATE_STR = datetime.now().strftime("%H:%M:%S")
+    old_spot, old_cw = b_spx["spot"], b_spx["call_wall"]
+    old_v, now_v = b_spx["strike_map"].get(old_cw, 0), spx["strike_map"].get(old_cw, 0)
 
+    if old_cw > spot and old_v > 3.0 and now_v < old_v * 0.62:
+        aid = f"NODE_GONE_{old_cw:.0f}"
+        alerts_dict[aid] = {
+            "id": aid, "level": "danger", "sound": "alarm",
+            "voice": f"警报！对比{ref_label}，上方正Gamma节点 {old_cw/10:.1f} 衰减消失，请下调 XSP Call 止盈目标至 {cw/10:.1f}",
+            "title": f"🚨【信号1：上方节点蒸发 ({ref_label}对比)】SPX {old_cw:.0f} (XSP {old_cw/10:.1f})",
+            "desc": f"上方正GEX节点从 +${old_v:.1f}M 骤降至 +${now_v:.1f}M！立即将 XSP Call 止盈位下调至 {cw/10:.1f} (▲)！"
+        }
+    if cw < old_cw:
+        aid = f"CEIL_LOW_{cw:.0f}"
+        alerts_dict[aid] = {
+            "id": aid, "level": "warning", "sound": "beep",
+            "voice": f"提示！对比{ref_label}，上方第一阻力轨下移至 XSP {cw/10:.1f}，反抽触及请先减仓",
+            "title": f"📉【信号3：阻力上轨下移 ({ref_label}对比)】▲ 从 {old_cw:.0f} 下移至 {cw:.0f} (XSP {cw/10:.1f})",
+            "desc": f"日内第一反弹天花板已降至 XSP {cw/10:.1f}，多单反抽触及必须先减仓 30%~50%！"
+        }
+    reclaimed_flip = (old_spot < b_spx["flip_strike"] and spot >= flip)
+    neg_squeeze = (spot > old_spot + 7.5 and spx["strike_map"].get(spx["atm_strike"], 0) < -1.0)
+    if reclaimed_flip or neg_squeeze:
+        rec_strike = math.ceil(xsp_spot) + 1
+        aid = f"ROCKET_SQUEEZE_{int(xsp_spot)}"
+        alerts_dict[aid] = {
+            "id": aid, "level": "rocket", "sound": "rocket",
+            "voice": f"小火箭逼空点火信号！指数冲破负Gamma加速区，可顺势关注 XSP {rec_strike} Call，第一止盈看 {cw/10:.1f}",
+            "title": f"🚀【信号4：小火箭负GEX逼空点火 ({ref_label}触发)】现价突破 XSP {xsp_spot:.1f}",
+            "desc": f"做市商被迫追买期货助涨！👉 XSP 操作：右侧顺势关注 XSP {rec_strike}C，第一止盈看 XSP {cw/10:.1f} (▲)！"
+        }
+    if old_spot > pt and spot <= pt - 2.0:
+        aid = f"FLUSH_BREAK_{pt:.0f}"
+        alerts_dict[aid] = {
+            "id": aid, "level": "danger", "sound": "alarm",
+            "voice": f"严重警报！指数跌穿下方破位红线 XSP {pt/10:.1f}，多单请严格执行止损",
+            "title": f"🌊【信号5：铁底坍塌破位 ({ref_label}触发)】跌穿 SPX {pt:.0f} (XSP {pt/10:.1f} ▼)",
+            "desc": f"指数放量跌穿 ▼ 破位点！👉 XSP 操作：日内多单无条件止损，反手关注 XSP {math.floor(xsp_spot)} Put！"
+        }
 
-def background_sync_worker():
-    while True:
+def refresh_all_now():
+    steps = {"SPX": 5, "XSP": 1, "SPY": 1, "QQQ": 1}
+    live_spots = fetch_realtime_spots()
+    new_data = {}
+    for tk, url in CBOE_URLS.items():
         try:
-            update_all_spots()
-            with ThreadPoolExecutor(max_workers=4) as ex:
-                list(ex.map(fetch_cboe_raw_chain, ["SPX", "XSP", "SPY", "QQQ"]))
-            rebuild_render_cache(use_ema=True)
+            new_data[tk] = fetch_cboe_gex(tk, url, steps[tk], mode=STATE["mode"], skew_adj=STATE["skew_adj"], live_spots=live_spots, num_strikes=30)
         except Exception as e:
-            print("Background sync warning:", e)
-        time.sleep(5.0)
+            print(f"[Warn] {tk}: {e}")
+    if not new_data or "SPX" not in new_data: return
 
+    est_now = get_est_now()
+    today_str, time_str = est_now.strftime("%Y-%m-%d"), est_now.strftime("%H:%M:%S")
+    is_rth = (est_now.hour > 9 or (est_now.hour == 9 and est_now.minute >= 30)) and (est_now.hour < 16)
 
-# ==================== 6. Flask 极速路由 ====================
-@app.route("/api/gex")
-def api_gex():
-    with CACHE_LOCK:
-        data_copy = dict(RENDER_CACHE)
-        ts = LAST_UPDATE_STR
+    if not STATE["baseline_data"] or STATE["trading_day"] != today_str:
+        STATE.update({"trading_day": today_str, "rth_locked": is_rth, "baseline_data": new_data, "baseline_time": f"{time_str} (自动锚定)"})
+        save_baseline_cache()
+    elif is_rth and not STATE["rth_locked"]:
+        STATE.update({"rth_locked": True, "baseline_data": new_data, "baseline_time": f"{time_str} (9:30开盘锁定)"})
+        ROLLING_HISTORY.clear()
+        save_baseline_cache()
 
-    all_alerts = []
-    for k, v in data_copy.items():
-        all_alerts.extend(v.get("alerts", []))
+    now_ts = time.time()
+    if not ROLLING_HISTORY or (now_ts - ROLLING_HISTORY[-1]["ts"] >= 60):
+        ROLLING_HISTORY.append({"ts": now_ts, "time": time_str, "data": new_data})
+    rolling_snap = ROLLING_HISTORY[0]
+    for s in ROLLING_HISTORY:
+        if now_ts - s["ts"] >= 900: rolling_snap = s
+    STATE["rolling_time"] = f"{rolling_snap['time']} (滑动窗口)"
 
-    return jsonify({
-        "timestamp": ts,
-        "ready": len(data_copy) > 0,
-        "weekly_mode": WEEKLY_MODE,
-        "live_flow_mode": LIVE_FLOW_MODE,
-        "noise_reduction": NOISE_REDUCTION,
-        "data": data_copy,
-        "alerts": all_alerts,
+    alerts_dict = {}
+    check_reference_shifts(new_data, STATE["baseline_data"], "今日基准", alerts_dict)
+    check_reference_shifts(new_data, rolling_snap["data"], "15分钟前", alerts_dict)
+
+    spx, xsp = new_data["SPX"], new_data.get("XSP")
+    spot, cw, pw, pt, flip = spx["spot"], spx["call_wall"], spx["put_wall"], spx["put_trigger"], spx["flip_strike"]
+    xsp_spot = spot / 10.0
+    if spx["strike_map"].get(pw, 0) <= 0 and xsp and xsp["strike_map"].get(xsp["put_wall"], 0) > 0:
+        pw = xsp["put_wall"] * 10.0
+
+    cboe_diff = spot - spx.get("cboe_delayed", spot)
+    sess_tag = f"期权到期:{spx['exp']} | 修正CBOE延时 {cboe_diff:+.1f}点"
+    if spot <= pt:
+        regime, a0, awk = f"🌊 负Gamma破位区 ({sess_tag})", f"反抽不破 XSP {flip/10:.1f} (◆) 偏空，勿盲目接刀 0DTE Call。", f"周权 XSP Call 等站稳 {pw/10:.1f} 上方再操作。"
+    elif spot >= flip:
+        regime, a0, awk = f"📈 正Gamma偏多区 ({sess_tag})", f"回踩 XSP {pw/10:.1f} 企稳短多，触及 {cw/10:.1f} (▲) 止盈。", f"周权 760C 持有，冲高进入 XSP {cw/10:.1f} 减半仓锁利。"
+    else:
+        regime, a0, awk = f"⚖️ 多空拉锯修复区 ({sess_tag})", f"下方支撑看 XSP {pw/10:.1f}，反弹目标看 {flip/10:.1f} (◆) 与 {cw/10:.1f} (▲)。", f"紧盯能否收复 XSP {flip/10:.1f} (◆)，冲高至 {cw/10:.1f} 减仓。"
+
+    STATE.update({
+        "current_data": new_data, "last_update": f"{time_str} EST", "alerts": list(alerts_dict.values()),
+        "xsp_advice": {
+            "xsp_spot": f"{xsp_spot:.2f}", "spx_spot": f"{spot:.2f}", "regime": regime,
+            "xsp_support": f"{pw/10:.1f} (SPX {pw:.0f})", "xsp_resistance": f"{cw/10:.1f} (SPX {cw:.0f} ▲)",
+            "xsp_breakdown": f"{pt/10:.1f} (SPX {pt:.0f} ▼)", "xsp_flip": f"{flip/10:.1f} (SPX {flip:.0f} ◆)",
+            "action_0dte": a0, "action_weekly": awk
+        }
     })
 
+def background_updater():
+    load_baseline_cache()
+    last_self_ping = 0
+    while True:
+        refresh_all_now()
+        ext_url = os.environ.get("RENDER_EXTERNAL_URL")
+        if ext_url and (time.time() - last_self_ping >= 480):
+            try:
+                requests.get(f"{ext_url.rstrip('/')}/api/ping", timeout=8)
+                last_self_ping = time.time()
+            except Exception:
+                pass
+        time.sleep(8)
 
-@app.route("/api/toggle_weekly", methods=["POST"])
-def toggle_weekly():
-    global WEEKLY_MODE
-    WEEKLY_MODE = not WEEKLY_MODE
-    rebuild_render_cache(use_ema=False)
-    return jsonify({"status": "ok", "weekly_mode": WEEKLY_MODE})
+def ensure_bg_services():
+    global BG_STARTED
+    with BG_LOCK:
+        if not BG_STARTED:
+            BG_STARTED = True
+            t1 = threading.Thread(target=background_updater, daemon=True)
+            t1.start()
+            t2 = threading.Thread(target=start_public_tunnel, daemon=True)
+            t2.start()
 
+HTML_LINES = [
+    '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">',
+    '<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">',
+    '<title>XSP / SPX 实时 GEX 作战指挥舱</title><style>',
+    'body{background:#0b0f17;color:#e2e8f0;font-family:-apple-system,BlinkMacSystemFont,"Microsoft YaHei",sans-serif;margin:0;padding:8px}',
+    '.top-bar{display:flex;justify-content:space-between;align-items:center;background:#141b2d;padding:8px 12px;border-radius:8px;border:1px solid #232f46;margin-bottom:8px;flex-wrap:wrap;gap:6px}',
+    '.btn{background:#2563eb;color:#fff;border:none;padding:6px 9px;border-radius:5px;cursor:pointer;font-size:11.5px;font-weight:600;margin:1px}',
+    '.btn-sec{background:#334155}.btn-gold{background:#b45309}.btn-green{background:#059669}.btn-rocket{background:linear-gradient(90deg,#7e22ce,#ec4899)}',
+    'select.btn-sec{appearance:auto;background:#1e293b;border:1px solid #38bdf8;color:#38bdf8;padding:5px 8px;font-weight:700}',
+    '.legend-bar{display:flex;align-items:center;gap:5px;flex-wrap:wrap;background:#111827;padding:6px 8px;border-radius:8px;border:1px solid #1f2937;margin-bottom:8px;font-size:11.5px}',
+    '.lg-badge{padding:2px 6px;border-radius:4px;cursor:pointer;font-weight:600;border:1px solid rgba(255,255,255,0.12)}',
+    '.drawer{display:none;background:#111827;border:1px solid #38bdf8;border-radius:8px;padding:10px;margin-bottom:10px;font-size:11.5px;line-height:1.45}',
+    '.drawer-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}',
+    '.d-table{width:100%;border-collapse:collapse}.d-table th,.d-table td{border:1px solid #263147;padding:5px;text-align:left}.d-table th{background:#1e293b;color:#38bdf8}',
+    '.alert-box{padding:8px 12px;border-radius:6px;margin-bottom:8px;font-size:12.5px;cursor:pointer}',
+    '.alert-danger{background:rgba(220,38,38,0.22);border-left:4px solid #ef4444;color:#fecaca}',
+    '.alert-warning{background:rgba(234,179,8,0.22);border-left:4px solid #eab308;color:#fef08a}',
+    '.alert-rocket{background:linear-gradient(90deg,rgba(126,34,206,0.35),rgba(236,72,153,0.25));border-left:4px solid #f472b6;color:#fdf2f8}',
+    '.cmd-panel{background:#111827;border:1px solid #374151;border-radius:8px;padding:10px;margin-bottom:10px;display:grid;grid-template-columns:1.25fr 2fr;gap:10px}',
+    '.levels-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:12px}',
+    '.lvl-card{background:#1e293b;padding:6px 8px;border-radius:6px;cursor:pointer}.lvl-label{color:#94a3b8;font-size:10.5px}.lvl-val{font-size:13.5px;font-weight:700;margin-top:2px}',
+    '.advice-box{font-size:12.5px;line-height:1.55;background:#1e293b;padding:8px 12px;border-radius:6px;border-left:4px solid #38bdf8}',
+    '.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}',
+    '.col-card{background:#131824;border:1px solid #222b3d;border-radius:8px;overflow:hidden}',
+    '.col-hdr{padding:7px;background:#192132;border-bottom:1px solid #263147}',
+    '.col-title{display:flex;justify-content:space-between;font-weight:700;font-size:13px;white-space:nowrap}',
+    '.pills{display:flex;gap:3px;flex-wrap:wrap;margin-top:5px;font-size:10.5px;font-weight:600}',
+    '.pill{padding:1px 4px;border-radius:3px;background:#0f172a;border:1px solid #334155;cursor:pointer}',
+    '.pill-up{color:#facc15}.pill-dn{color:#c084fc}.pill-fl{color:#60a5fa}',
+    'table.gex-tbl{width:100%;border-collapse:collapse;font-size:11.5px;font-variant-numeric:tabular-nums}',
+    'table.gex-tbl td{padding:3.5px 6px;border-bottom:1px solid rgba(255,255,255,0.04);cursor:pointer;white-space:nowrap}',
+    '.strike-col{font-weight:600;color:#cbd5e1}.gex-col{text-align:right;font-weight:700}',
+    '.gex-king-pos{background:#eab308;color:#0f172a}.gex-mid-pos{background:#2f855a;color:#f0fff4}.gex-low-pos{background:#1b4332;color:#a7f3d0}',
+    '.gex-king-neg{background:#6b21a8;color:#f3e8ff}.gex-mid-neg{background:#4c1d95;color:#ddd6fe}.gex-low-neg{background:#1e293b;color:#94a3b8}',
+    '.spot-row{outline:2px solid #38bdf8}',
+    '#floating-tip{position:fixed;display:none;z-index:9999;max-width:340px;background:rgba(15,23,42,0.98);color:#f8fafc;border:1px solid #38bdf8;border-radius:8px;padding:10px;font-size:12px;line-height:1.5;box-shadow:0 10px 25px rgba(0,0,0,0.8)}',
+    '#floating-tip .tip-title{font-weight:700;color:#38bdf8;font-size:13px;margin-bottom:4px;border-bottom:1px solid #334155;padding-bottom:3px}',
+    '#floating-tip .tip-act{color:#fde047;font-weight:600;margin-top:4px}',
+    '#modal-overlay,#qr-overlay{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.75);display:none;justify-content:center;align-items:center;z-index:10000}',
+    '#modal-card,#qr-card{background:#111827;border:2px solid #f472b6;border-radius:12px;max-width:460px;width:90%;padding:18px;box-shadow:0 0 40px rgba(0,0,0,0.8)}',
+    '@media (max-width:920px){',
+    '  .cmd-panel{grid-template-columns:1fr}.drawer-grid{grid-template-columns:1fr}',
+    '  .grid-4{grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}',
+    '  table.gex-tbl{font-size:11px}table.gex-tbl td{padding:3px 4px}',
+    '  .col-title{font-size:12px}#floating-tip{left:4%!important;top:auto!important;bottom:14px!important;width:86%!important;max-width:none}',
+    '}',
+    '.force-1col{grid-template-columns:1fr!important}',
+    '</style></head><body onclick="hideTip()">',
+    '<div id="floating-tip" onclick="hideTip()"></div>',
+    '<div id="modal-overlay" onclick="closeModal()"><div id="modal-card" onclick="event.stopPropagation()">',
+    '<div id="m-title" style="font-size:16.5px;font-weight:800;color:#f472b6;margin-bottom:8px;"></div>',
+    '<div id="m-desc" style="font-size:13.5px;line-height:1.55;color:#e2e8f0;margin-bottom:14px;white-space:pre-line;"></div>',
+    '<div style="display:flex;justify-content:flex-end;gap:8px;">',
+    '<button class="btn btn-sec" onclick="replayVoice()">🔊 重播语音</button>',
+    '<button class="btn" onclick="closeModal()">✅ 我已收到</button></div></div></div>',
+    '<div id="qr-overlay" onclick="closeQr()"><div id="qr-card" style="border-color:#10b981;text-align:center;" onclick="event.stopPropagation()">',
+    '<div style="font-size:17px;font-weight:800;color:#34d399;margin-bottom:6px;">📱 手机扫码随时看盘 (支持iPhone双列)</div>',
+    '<img id="qr-img" src="" style="width:190px;height:190px;background:#fff;padding:6px;border-radius:8px;margin-bottom:8px;"/>',
+    '<div style="background:#1e293b;padding:7px;border-radius:6px;font-size:11.5px;word-break:break-all;color:#38bdf8;margin-bottom:6px;" id="pub-url-txt"></div>',
+    '<div style="font-size:11px;color:#94a3b8;margin-bottom:12px;" id="lan-url-txt"></div>',
+    '<button class="btn btn-green" onclick="closeQr()">✅ 完成</button></div></div>',
+    '<div class="top-bar"><div><b style="font-size:16px;">⚡ XSP / SPX 实时 GEX 指挥舱</b><div id="meta-info" style="font-size:11px;color:#4ade80;margin-top:2px;">同步中...</div></div>',
+    '<div><button class="btn btn-green" onclick="openQr()">📱 手机扫码</button>',
+    '<button class="btn btn-rocket" onclick="testRocketAlert()">🚀 测试小火箭</button>',
+    '<button class="btn btn-sec" onclick="toggleAudio()" id="audio-btn">🔊 语音:开</button>',
+    '<button class="btn btn-gold" onclick="toggleDrawer()">📖 字典&铁律</button>',
+    '<button class="btn btn-sec" onclick="toggleCols()" id="col-btn">📱 双列/单列</button>',
+    '<button class="btn btn-sec" onclick="toggleSkew()" id="skew-btn">⚖️ 标准OI</button>',
+    '<select id="exp-select" class="btn btn-sec" onchange="changeExp(this.value)">',
+    '<option value="next">⚡ 自动 (盘后跳明日)</option>',
+    '<option value="weekly">📅 全周汇总 (5期)</option>',
+    '</select></div></div>',
+    '<div class="legend-bar"><span style="color:#94a3b8;font-weight:600;">💡 点击/悬停色块看XSP指令：</span>',
+    '<span class="lg-badge gex-king-pos" onclick="event.stopPropagation();showTip(event,\'KING_POS\')">🟨 亮黄墙+GEX*</span>',
+    '<span class="lg-badge gex-mid-pos" onclick="event.stopPropagation();showTip(event,\'MID_POS\')">🟩 青绿缓冲</span>',
+    '<span class="lg-badge gex-king-neg" onclick="event.stopPropagation();showTip(event,\'KING_NEG\')">🟪 深紫核爆-GEX*</span>',
+    '<span class="lg-badge" style="background:#1e293b;color:#facc15" onclick="event.stopPropagation();showTip(event,\'CROWN\')">👑 皇冠</span>',
+    '<span class="lg-badge" style="background:#1e293b;color:#facc15" onclick="event.stopPropagation();showTip(event,\'UP_WALL\')">▲ 上轨阻力</span>',
+    '<span class="lg-badge" style="background:#1e293b;color:#c084fc" onclick="event.stopPropagation();showTip(event,\'DN_TRIG\')">▼ 破位红线</span>',
+    '<span class="lg-badge" style="background:#1e293b;color:#60a5fa" onclick="event.stopPropagation();showTip(event,\'FLIP\')">◆ 翻转点</span></div>',
+    '<div class="drawer" id="guide-drawer"><div class="drawer-grid"><div><b style="color:#facc15;">一、StrikeGEX 标记拆解与 XSP 实盘字典</b>',
+    '<table class="d-table" style="margin-top:4px;"><tr><th>标记</th><th>含义</th><th>XSP 傻瓜操作指令</th></tr>',
+    '<tr><td><b style="color:#eab308">🟨 亮黄+*</b></td><td>最大正GEX铁墙</td><td>跌到下方黄墙<b>严禁追Put</b>；涨到上方黄墙<b>多单止盈</b></td></tr>',
+    '<tr><td><b style="color:#c084fc">🟪 深紫+👑</b></td><td>最大负GEX核爆区</td><td>跌入紫区<b>顺势买Put</b>；向上冲破紫区<b>追Call博小火箭逼空</b></td></tr>',
+    '<tr><td><b style="color:#facc15">▲ 上三角</b></td><td>上方第一阻力轨</td><td>XSP Call <b>第一刚性减仓/止盈位</b>(触及先平30%~50%)</td></tr>',
+    '<tr><td><b style="color:#c084fc">▼ 下三角</b></td><td>下方破位触发点</td><td>XSP Call <b>绝对硬止损线</b>；实体跌穿无条件砍多单</td></tr>',
+    '<tr><td><b style="color:#60a5fa">◆ 菱形</b></td><td>多空翻转分界线</td><td>◆上方高抛低吸；◆下方反弹皆为反抽，<b>勿死拿远端虚值Call</b></td></tr></table></div>',
+    '<div><b style="color:#38bdf8;">二、六大盘中异动信号与 XSP 应对铁律</b>',
+    '<table class="d-table" style="margin-top:4px;"><tr><th>信号</th><th>特征</th><th>XSP 应对铁律</th></tr>',
+    '<tr><td><b>🚨 1.节点蒸发</b></td><td>上方正GEX缩水超40%</td><td><b>立刻下调Call止盈至最近▲</b>，0DTE远端Call趁反抽清仓</td></tr>',
+    '<tr><td><b>🧱 2.铁墙增厚</b></td><td>下方黄墙增厚超25%</td><td>横盘绞肉机！<b>0DTE立刻离场</b>；周权Call依托铁底持有</td></tr>',
+    '<tr><td><b>📉 3.上轨下移</b></td><td>顶部▲向下移动</td><td><b>多单反抽到新▲位置必须先减仓</b>，不可盲目格局</td></tr>',
+    '<tr><td><b>🚀 4.小火箭逼空</b></td><td>冲破◆或深紫负GEX区</td><td>做市商追买期货！<b>顺势买XSP浅虚值Call</b>，拿到▲止盈</td></tr>',
+    '<tr><td><b>🌊 5.铁底破位</b></td><td>跌穿黄墙并击穿▼</td><td>触发负Gamma瀑布！<b>XSP多单无条件止损</b>，反手买Put</td></tr></table></div></div></div>',
+    '<div id="alerts-container"></div>',
+    '<div class="cmd-panel" id="cmd-panel" style="display:none;"><div class="levels-grid">',
+    '<div class="lvl-card" onclick="event.stopPropagation();showTip(event,\'SPOT_M\')"><div class="lvl-label">XSP 毫秒级实时点位</div><div class="lvl-val" id="v-spot" style="color:#38bdf8;">-</div></div>',
+    '<div class="lvl-card" onclick="event.stopPropagation();showTip(event,\'FLIP\')"><div class="lvl-label">多空翻转点 (◆ Flip)</div><div class="lvl-val" id="v-flip" style="color:#60a5fa;">-</div></div>',
+    '<div class="lvl-card" onclick="event.stopPropagation();showTip(event,\'UP_WALL\')"><div class="lvl-label">上方第一阻力 (▲ Call Wall)</div><div class="lvl-val" id="v-cw" style="color:#facc15;">-</div></div>',
+    '<div class="lvl-card" onclick="event.stopPropagation();showTip(event,\'PW_CARD\')"><div class="lvl-label">下方支撑墙 (Put Support)</div><div class="lvl-val" id="v-pw" style="color:#4ade80;">-</div></div></div>',
+    '<div class="advice-box"><div style="font-weight:700;color:#38bdf8;margin-bottom:3px;" id="v-regime">-</div>',
+    '<div><b>🎯 短线(0DTE)：</b><span id="v-0dte">-</span></div>',
+    '<div style="margin-top:3px;"><b>📅 周五(周权)：</b><span id="v-weekly">-</span></div>',
+    '<div style="margin-top:3px;font-size:11px;color:#94a3b8;">🚨 破位红线 (▼ Put Trigger)：<span id="v-pt" style="color:#f87171;font-weight:700;">-</span></div></div></div>',
+    '<div class="grid-4" id="gex-grid"></div><script>',
+    'let audioEnabled=true,seenAlerts=new Set(),lastVoiceText="",lastAdvice={},pubUrl="",lanUrl="",lastExpsKey="";',
+    'function playTone(type){if(!audioEnabled)return;try{const ctx=new (window.AudioContext||window.webkitAudioContext)();',
+    'const notes=type==="rocket"?[523.25,659.25,783.99,1046.5]:(type==="alarm"?[880,440,880,440]:[660,880]);',
+    'notes.forEach((freq,idx)=>{const osc=ctx.createOscillator(),gain=ctx.createGain();',
+    'osc.type=type==="alarm"?"sawtooth":"triangle";osc.frequency.value=freq;',
+    'gain.gain.setValueAtTime(0.18,ctx.currentTime+idx*0.14);gain.gain.exponentialRampToValueAtTime(0.001,ctx.currentTime+(idx+1)*0.14);',
+    'osc.connect(gain);gain.connect(ctx.destination);osc.start(ctx.currentTime+idx*0.14);osc.stop(ctx.currentTime+(idx+1)*0.14);});}catch(e){}}',
+    'function speakText(txt){if(!audioEnabled||!txt)return;lastVoiceText=txt;try{window.speechSynthesis.cancel();',
+    'const u=new SpeechSynthesisUtterance(txt);u.lang="zh-CN";u.rate=1.08;window.speechSynthesis.speak(u);}catch(e){}}',
+    'function replayVoice(){if(lastVoiceText)speakText(lastVoiceText);}',
+    'function triggerPopupAlert(a){if(!audioEnabled)return;document.getElementById("m-title").innerText=a.title;',
+    'document.getElementById("m-desc").innerText=a.desc;document.getElementById("modal-card").style.borderColor=a.level==="rocket"?"#f472b6":(a.level==="danger"?"#ef4444":"#eab308");',
+    'document.getElementById("modal-overlay").style.display="flex";playTone(a.sound||"rocket");speakText(a.voice||a.title);}',
+    'function closeModal(){document.getElementById("modal-overlay").style.display="none";}',
+    'function openQr(){document.getElementById("qr-overlay").style.display="flex";',
+    'const target=pubUrl.startsWith("http")?pubUrl:window.location.href;',
+    'document.getElementById("qr-img").src=`https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(target)}`;',
+    'document.getElementById("pub-url-txt").innerText=`🌐 手机公网网址: ${target}`;',
+    'document.getElementById("lan-url-txt").innerText=`🏠 同WiFi局域网: ${lanUrl}`;}',
+    'function closeQr(){document.getElementById("qr-overlay").style.display="none";}',
+    'function toggleAudio(){audioEnabled=!audioEnabled;document.getElementById("audio-btn").innerText=`🔊 语音:${audioEnabled?"开":"静"}`;if(audioEnabled)speakText("语音已开启");}',
+    'function toggleCols(){document.getElementById("gex-grid").classList.toggle("force-1col");}',
+    'function testRocketAlert(){const sp=lastAdvice.xsp_spot||"734.1",cw=lastAdvice.xsp_resistance||"736.0 (SPX 7355 ▲)",fl=lastAdvice.xsp_flip||"735.5",st=Math.ceil(parseFloat(sp)||734)+1;',
+    'triggerPopupAlert({level:"rocket",sound:"rocket",title:`🚀【小火箭逼空点火信号】突破 XSP ${sp}`,',
+    'desc:`多头冲破翻转线(${fl})与负Gamma加速区，做市商被迫追买期货助涨！\\n\\n👉 0DTE指令：顺势关注 XSP ${st} Call，第一止盈看 ${cw}！\\n👉 周五760C指令：冲高进入 ${cw} 区间先减仓 30%~50% 锁利！`,',
+    'voice:`小火箭逼空点火信号！指数冲破负Gamma加速带，短线可顺势关注 XSP ${st} Call，第一止盈看 ${cw.split(" ")[0]}`});}',
+    'const TIP_DICT={',
+    'KING_POS:{t:"🟨 亮黄最大正GEX铁墙 (+GEX*)",d:"做市商严格执行【逢低买、逢高卖】对冲。",a:"👉 XSP操作：跌到下方黄墙严禁追Put；涨到上方黄墙多单分批止盈！"},',
+    'MID_POS:{t:"🟩 青绿次级正GEX缓冲区",d:"波动率被压缩，价格经过此处易减速停顿。",a:"👉 XSP操作：可作为顺势单第一减仓位或回踩观察位。"},',
+    'KING_NEG:{t:"🟪 深紫最大负GEX核爆区 (-GEX*)",d:"做市商被迫【越跌越卖、越涨越买】顺势助涨助跌！",a:"👉 XSP操作：向下跌穿买Put；向上冲破追Call吃小火箭逼空段！"},',
+    'CROWN:{t:"👑 皇冠标记 (全场最大敞口)",d:"该品种单档Gamma绝对值最大的主战场。",a:"👉 XSP操作：黄皇冠高抛低吸；紫皇冠突破顺势追单。"},',
+    'UP_WALL:{t:"▲ 橙色上三角 (上方第一阻力轨)",d:"现价上方正Gamma最强的多头目标天花板。",a:"👉 XSP操作：XSP Call 第一止盈减仓位！反抽触及先平30%~50%。"},',
+    'DN_TRIG:{t:"▼ 紫色下三角 (破位瀑布红线)",d:"下方负Gamma核爆临界点，失守将转为顺势砸盘。",a:"👉 XSP操作：XSP Call 绝对硬止损线！实体跌穿无条件止损。"},',
+    'FLIP:{t:"◆ 蓝紫菱形 (多空翻转点)",d:"正Gamma震荡与负Gamma单边的分界线。",a:"👉 XSP操作：站稳◆上方回调接Call；压在◆下方反弹皆为反抽！"},',
+    'SPOT_M:{t:"M 现价锚定格 (CNBC+Yahoo毫秒级实时点位)",d:"已彻底修复CBOE盘中15分钟延迟问题，实时同步当前成交价。",a:"👉 XSP操作：日内买卖期权只选 M 上下 2~4 点以内的合约。"},',
+    'PW_CARD:{t:"🛡️ 下方支撑墙",d:"现价下方承接力最强的正GEX铁底。",a:"👉 XSP操作：回踩企稳不破时是平Put或博反抽买点。"}',
+    '};',
+    'function showTip(e,key){const box=document.getElementById("floating-tip"),it=TIP_DICT[key];if(!it)return;',
+    'box.innerHTML=`<div class="tip-title">${it.t}</div><div>${it.d}</div><div class="tip-act">${it.a}</div>`;box.style.display="block";moveTip(e);}',
+    'function showRowTip(e,tk,strike,xspEq,gexStr,cls,posRel,badges){const box=document.getElementById("floating-tip"),isPos=cls.includes("pos"),isKing=cls.includes("king");',
+    'let title=`${tk} ${strike} (折合 XSP ${xspEq}) | ${gexStr}`;',
+    'let desc=isPos?(isKing?"🟨 亮黄最大正GEX铁墙：阻力与支撑极强。":"🟩 正GEX缓冲带：抑制波动。"):(isKing?"🟪 深紫最大负GEX核爆区：突破或跌破时波动剧烈放大！":"🟪 负GEX加速带：易加速滑动。");',
+    'let act=posRel==="above"?(isPos?`👉 在现价【上方】：属反弹阻力墙，涨到 XSP ${xspEq} 附近分批止盈！`:`👉 在现价【上方】：属负GEX空头回补带，冲破 XSP ${xspEq} 将触发🚀小火箭逼空！`):(posRel==="below"?(isPos?`👉 在现价【下方】：属正GEX护盘铁底，回踩 XSP ${xspEq} 严禁追Put！`:`👉 在现价【下方】：属负GEX助跌雷区，跌穿 XSP ${xspEq} 警惕瀑布杀跌！`):`👉 当前现价 M 肉搏区：严格带好止损！`);',
+    'box.innerHTML=`<div class="tip-title">${title}</div><div>${desc}</div><div class="tip-act">${act}</div>`;box.style.display="block";moveTip(e);}',
+    'function moveTip(e){if(!e||window.innerWidth<=920)return;const box=document.getElementById("floating-tip");let x=e.clientX+14,y=e.clientY+14;',
+    'if(x+350>window.innerWidth)x=e.clientX-355;if(y+200>window.innerHeight)y=e.clientY-190;box.style.left=x+"px";box.style.top=y+"px";}',
+    'function hideTip(){document.getElementById("floating-tip").style.display="none";}',
+    'function toggleDrawer(){const d=document.getElementById("guide-drawer");d.style.display=d.style.display==="block"?"none":"block";}',
+    'async function loadData(){const res=await fetch("/api/gex"),d=await res.json();',
+    'pubUrl=d.public_url||"";lanUrl=d.lan_url||"";',
+    'document.getElementById("skew-btn").innerText=`⚖️ ${d.skew_adj?"偏度微调":"标准OI"}`;',
+    'document.getElementById("meta-info").innerText=`🌐 ${pubUrl} | 刷新:${d.last_update} | 基准:${d.baseline_time}`;',
+    'const selEl=document.getElementById("exp-select");',
+    'if(selEl&&d.available_exps){const expsKey=d.available_exps.join(",");',
+    'if(expsKey!==lastExpsKey){lastExpsKey=expsKey;',
+    'const fixedOpts=`<option value="next">⚡ 自动 (盘后跳明日)</option><option value="weekly">📅 全周汇总 (5期)</option>`;',
+    'const dateOpts=d.available_exps.map(e=>`<option value="${e}">🎯 指定: 20${e.slice(0,2)}-${e.slice(2,4)}-${e.slice(4)}</option>`).join("");',
+    'selEl.innerHTML=fixedOpts+dateOpts;}selEl.value=d.mode||"next";}',
+    'const alerts=d.alerts||[];',
+    'document.getElementById("alerts-container").innerHTML=alerts.map(a=>`<div class="alert-box alert-${a.level}" onclick=\'triggerPopupAlert(${JSON.stringify(a)})\'><b>${a.title} (点击重播)</b><br>${a.desc}</div>`).join("");',
+    'alerts.forEach(a=>{if(!seenAlerts.has(a.id)){seenAlerts.add(a.id);triggerPopupAlert(a);}});',
+    'if(d.xsp_advice&&d.xsp_advice.xsp_spot){lastAdvice=d.xsp_advice;document.getElementById("cmd-panel").style.display="grid";',
+    'document.getElementById("v-spot").innerText=`${d.xsp_advice.xsp_spot} (SPX ${d.xsp_advice.spx_spot})`;',
+    'document.getElementById("v-flip").innerText=d.xsp_advice.xsp_flip;document.getElementById("v-cw").innerText=d.xsp_advice.xsp_resistance;',
+    'document.getElementById("v-pw").innerText=d.xsp_advice.xsp_support;document.getElementById("v-pt").innerText=d.xsp_advice.xsp_breakdown;',
+    'document.getElementById("v-regime").innerText=d.xsp_advice.regime;document.getElementById("v-0dte").innerText=d.xsp_advice.action_0dte;',
+    'document.getElementById("v-weekly").innerText=d.xsp_advice.action_weekly;}',
+    'const order=["SPX","XSP","SPY","QQQ"];document.getElementById("gex-grid").innerHTML=order.map(tk=>{const it=d.current_data[tk];',
+    'if(!it)return`<div class="col-card"><div class="col-hdr">${tk} 同步中...</div></div>`;',
+    'const rHtml=it.rows.map(r=>{const bStr=(r.badges||[]).join("");',
+    'return`<tr class="${r.color_cls} ${r.is_spot?"spot-row":""}" onclick="event.stopPropagation();showRowTip(event,\'${tk}\',\'${r.strike}\',\'${r.xsp_eq}\',\'${r.gex_str}\',\'${r.color_cls}\',\'${r.pos_rel}\',\'${bStr}\')" onmousemove="showRowTip(event,\'${tk}\',\'${r.strike}\',\'${r.xsp_eq}\',\'${r.gex_str}\',\'${r.color_cls}\',\'${r.pos_rel}\',\'${bStr}\')"><td class="strike-col">${r.strike}<span style="font-size:10px;margin-left:2px;">${bStr}</span></td><td class="gex-col">${r.gex_str}</td></tr>`;}).join("");',
+    'return`<div class="col-card"><div class="col-hdr"><div class="col-title"><span>${tk} (${it.exp})</span><span>$${it.spot.toFixed(2)}</span></div>',
+    '<div class="pills"><span class="pill pill-fl" onclick="event.stopPropagation();showTip(event,\'FLIP\')">◆${it.flip_strike}</span>',
+    '<span class="pill pill-up" onclick="event.stopPropagation();showTip(event,\'UP_WALL\')">▲${it.call_wall}</span>',
+    '<span class="pill pill-dn" onclick="event.stopPropagation();showTip(event,\'DN_TRIG\')">▼${it.put_trigger}</span></div></div>',
+    '<table class="gex-tbl"><tbody>${rHtml}</tbody></table></div>`;}).join("");}',
+    'async function changeExp(val){await fetch("/api/set_exp?mode="+encodeURIComponent(val),{method:"POST"});loadData();}',
+    'async function toggleSkew(){await fetch("/api/toggle_skew",{method:"POST"});loadData();}',
+    'loadData();setInterval(loadData,8000);</script></body></html>'
+]
+HTML_PAGE = "\n".join(HTML_LINES)
 
-@app.route("/api/toggle_flow", methods=["POST"])
-def toggle_flow():
-    global LIVE_FLOW_MODE
-    LIVE_FLOW_MODE = not LIVE_FLOW_MODE
-    rebuild_render_cache(use_ema=False)
-    return jsonify({"status": "ok", "live_flow_mode": LIVE_FLOW_MODE})
-
-
-@app.route("/api/toggle_noise", methods=["POST"])
-def toggle_noise():
-    global NOISE_REDUCTION
-    NOISE_REDUCTION = not NOISE_REDUCTION
-    rebuild_render_cache(use_ema=False)
-    return jsonify({"status": "ok", "noise_reduction": NOISE_REDUCTION})
-
-
-# ==================== 7. 前端可视化界面 ====================
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>GEX 实时量化指挥舱 (StrikeGEX Live Flow Pro)</title>
-<style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    background: #0b0e17;
-    color: #f8fafc;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Consolas, monospace;
-    padding: 8px;
-    overflow-x: hidden;
-  }
-  .topbar {
-    display: flex;
-    flex-wrap: wrap;
-    justify-content: space-between;
-    align-items: center;
-    background: #131826;
-    border: 1px solid #262f45;
-    border-radius: 8px;
-    padding: 8px 14px;
-    margin-bottom: 10px;
-    gap: 8px;
-  }
-  .brand {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    font-weight: 800;
-    font-size: 15px;
-    color: #e2e8f0;
-  }
-  .badge-live {
-    background: #064e3b;
-    color: #34d399;
-    border: 1px solid #059669;
-    padding: 2px 8px;
-    border-radius: 4px;
-    font-size: 11px;
-  }
-  .controls {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 8px;
-  }
-  .btn {
-    border: 1px solid #334155;
-    background: #1e293b;
-    color: #e2e8f0;
-    padding: 5px 12px;
-    border-radius: 5px;
-    font-size: 12px;
-    font-weight: 700;
-    cursor: pointer;
-    transition: all 0.12s;
-  }
-  .btn.active-day {
-    background: #10b981;
-    color: #052e16;
-    border-color: #34d399;
-    box-shadow: 0 0 10px rgba(16, 185, 129, 0.35);
-  }
-  .btn.active-week {
-    background: #8b5cf6;
-    color: #ffffff;
-    border-color: #a78bfa;
-    box-shadow: 0 0 10px rgba(139, 92, 246, 0.45);
-  }
-  .btn.active-flow {
-    background: #f59e0b;
-    color: #0f172a;
-    border-color: #fbbf24;
-    box-shadow: 0 0 10px rgba(245, 158, 11, 0.4);
-  }
-  .btn.active-sub {
-    background: #0284c7;
-    color: #fff;
-    border-color: #38bdf8;
-  }
-  .grid-container {
-    display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    gap: 8px;
-  }
-  @media (max-width: 900px) {
-    .grid-container { grid-template-columns: repeat(2, 1fr); }
-  }
-  .col-card {
-    background: #111624;
-    border: 1px solid #222b40;
-    border-radius: 8px;
-    overflow: hidden;
-    display: flex;
-    flex-direction: column;
-  }
-  .col-header {
-    padding: 8px 10px;
-    background: #161d2f;
-    border-bottom: 1px solid #262f45;
-  }
-  .title-row {
-    display: flex;
-    justify-content: space-between;
-    align-items: baseline;
-    font-weight: 800;
-    font-size: 14px;
-    margin-bottom: 6px;
-  }
-  .pct-tag {
-    font-size: 11px;
-    font-weight: 600;
-    margin-left: 4px;
-  }
-  .pills-row {
-    display: flex;
-    gap: 6px;
-    flex-wrap: wrap;
-  }
-  .pill {
-    font-size: 11px;
-    font-weight: 700;
-    padding: 2px 6px;
-    border-radius: 4px;
-    background: #1e293b;
-  }
-  .pill-flip { color: #60a5fa; border: 1px solid #1d4ed8; }
-  .pill-call { color: #facc15; border: 1px solid #a16207; }
-  .pill-put  { color: #c084fc; border: 1px solid #6b21a8; }
-
-  .ladder-body { display: flex; flex-direction: column; }
-  .strike-row {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 4px 10px;
-    font-size: 13px;
-    font-weight: 700;
-    border-bottom: 1px solid rgba(255,255,255,0.04);
-    cursor: crosshair;
-  }
-  .strike-row.spot-row {
-    outline: 2px solid #38bdf8;
-    z-index: 2;
-  }
-  .strike-left {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-  }
-  .m-tag {
-    font-size: 10px;
-    background: rgba(15, 23, 42, 0.8);
-    color: #38bdf8;
-    padding: 0px 4px;
-    border-radius: 3px;
-    border: 1px solid #38bdf8;
-  }
-  .col-footer {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 6px 10px;
-    font-size: 12px;
-    font-weight: 800;
-    background: linear-gradient(90deg, #581c87 0%, #1e293b 50%, #ca8a04 100%);
-    border-top: 1px solid #334155;
-  }
-  .loading-box {
-    grid-column: 1 / -1;
-    text-align: center;
-    padding: 60px 20px;
-    color: #94a3b8;
-    font-size: 15px;
-    font-weight: 700;
-  }
-  #tooltip {
-    position: fixed;
-    display: none;
-    background: rgba(15, 23, 42, 0.96);
-    border: 1px solid #475569;
-    border-radius: 6px;
-    padding: 8px 12px;
-    font-size: 12px;
-    color: #f1f5f9;
-    z-index: 9999;
-    pointer-events: none;
-    box-shadow: 0 8px 20px rgba(0,0,0,0.6);
-    min-width: 220px;
-  }
-  .alert-banner {
-    display: none;
-    justify-content: space-between;
-    align-items: center;
-    background: #7c2d12;
-    border: 1px solid #f97316;
-    color: #ffedd5;
-    padding: 7px 12px;
-    border-radius: 6px;
-    margin-bottom: 8px;
-    font-size: 13px;
-    font-weight: 700;
-  }
-</style>
-</head>
-<body>
-
-<div class="topbar">
-  <div class="brand">
-    <span>⚡ XSP / SPX GEX 指挥中心</span>
-    <span class="badge-live" id="clockTag">LIVE</span>
-  </div>
-  <div class="controls">
-    <button id="weekBtn" class="btn active-day" onclick="toggleMode('/api/toggle_weekly')">📅 周期: 当日 (0DTE)</button>
-    <button id="flowBtn" class="btn active-flow" onclick="toggleMode('/api/toggle_flow')">⚡ LIVE FLOW: ON (盘口动态)</button>
-    <button id="noiseBtn" class="btn active-sub" onclick="toggleMode('/api/toggle_noise')">🧹 降噪: ON</button>
-    <button id="soundBtn" class="btn" onclick="toggleSound()">🔊 语音: OFF</button>
-  </div>
-</div>
-
-<div id="alertBox" class="alert-banner">
-  <span id="alertText"></span>
-  <span style="cursor:pointer; padding:0 6px;" onclick="document.getElementById('alertBox').style.display='none'">✖</span>
-</div>
-<div id="grid" class="grid-container">
-  <div class="loading-box">⚡ 正在同步 CBOE 四标的当日/全周期权链稳态快照 (约 1~2 秒)...</div>
-</div>
-<div id="tooltip"></div>
-
-<script>
-let soundEnabled = false;
-let isFetching = false;
-let lastSpokenAlert = "";
-
-function formatGex(val) {
-  const absV = Math.abs(val);
-  const sign = val > 0 ? "+" : (val < 0 ? "-" : "");
-  if (absV >= 1.0) return `${sign}$${absV.toFixed(1)}M`;
-  if (absV >= 0.001) return `${sign}$${(absV * 1000).toFixed(0)}K`;
-  return "$0";
-}
-
-function getRowStyle(gex, intensity) {
-  if (gex >= 0) {
-    if (intensity > 0.55) {
-      return `background: linear-gradient(90deg, rgba(234,179,8,0.88), rgba(250,204,21,0.95)); color: #0f172a;`;
-    } else if (intensity > 0.22) {
-      return `background: rgba(21, 128, 61, ${0.45 + intensity * 0.45}); color: #f8fafc;`;
-    }
-    return `background: rgba(20, 83, 45, 0.35); color: #cbd5e1;`;
-  } else {
-    if (intensity > 0.55) {
-      return `background: linear-gradient(90deg, rgba(107,33,168,0.92), rgba(126,34,206,0.96)); color: #ffffff;`;
-    } else if (intensity > 0.20) {
-      return `background: rgba(88, 28, 135, ${0.45 + intensity * 0.45}); color: #f1f5f9;`;
-    }
-    return `background: rgba(59, 7, 100, 0.35); color: #94a3b8;`;
-  }
-}
-
-async function toggleMode(endpoint) {
-  await fetch(endpoint, { method: "POST" });
-  fetchGexData(true);
-}
-
-function toggleSound() {
-  soundEnabled = !soundEnabled;
-  const btn = document.getElementById("soundBtn");
-  btn.innerText = soundEnabled ? "🔊 语音: ON" : "🔊 语音: OFF";
-  btn.className = soundEnabled ? "btn active-sub" : "btn";
-}
-
-function speakAlert(text) {
-  if (!soundEnabled || !("speechSynthesis" in window) || text === lastSpokenAlert) return;
-  lastSpokenAlert = text;
-  const utter = new SpeechSynthesisUtterance(text);
-  utter.lang = "zh-CN";
-  utter.rate = 1.15;
-  window.speechSynthesis.speak(utter);
-}
-
-function showTooltip(e, ticker, row) {
-  const tt = document.getElementById("tooltip");
-  let flowDesc = "⚪ 盘口均衡";
-  if (row.avg_flow > 0.12) flowDesc = "🟡 抄底/平仓护盘 (Bid主动卖盘)";
-  else if (row.avg_flow < -0.12) flowDesc = "🟣 空头扫货加速 (Ask主动买盘)";
-
-  tt.innerHTML = `
-    <div style="font-weight:800; color:#38bdf8; margin-bottom:4px;">${ticker} Strike ${row.strike}</div>
-    <div>Net GEX: <b>${formatGex(row.net_gex)}</b></div>
-    <div>盘口流向: <b>${flowDesc}</b></div>
-    <hr style="border:0; border-top:1px solid #334155; margin:4px 0;">
-    <div>Call OI: ${row.call_oi.toLocaleString()} | Vol: ${row.call_vol.toLocaleString()}</div>
-    <div>Put OI: ${row.put_oi.toLocaleString()} | Vol: ${row.put_vol.toLocaleString()}</div>
-  `;
-  tt.style.display = "block";
-  tt.style.left = Math.min(e.clientX + 14, window.innerWidth - 230) + "px";
-  tt.style.top = Math.min(e.clientY + 14, window.innerHeight - 130) + "px";
-}
-
-function hideTooltip() {
-  document.getElementById("tooltip").style.display = "none";
-}
-
-async function fetchGexData(force = false) {
-  if (isFetching && !force) return;
-  isFetching = true;
-  try {
-    const res = await fetch("/api/gex");
-    const json = await res.json();
-
-    document.getElementById("clockTag").innerText = `LIVE ${json.timestamp}`;
-
-    const weekBtn = document.getElementById("weekBtn");
-    weekBtn.innerText = json.weekly_mode ? "📆 周期: 全周 (WEEKLY)" : "📅 周期: 当日 (0DTE)";
-    weekBtn.className = json.weekly_mode ? "btn active-week" : "btn active-day";
-
-    const flowBtn = document.getElementById("flowBtn");
-    flowBtn.innerText = json.live_flow_mode ? "⚡ LIVE FLOW: ON (盘口动态)" : "📊 STATIC OI (传统静态)";
-    flowBtn.className = json.live_flow_mode ? "btn active-flow" : "btn";
-
-    const noiseBtn = document.getElementById("noiseBtn");
-    noiseBtn.innerText = json.noise_reduction ? "🧹 降噪: ON" : "🧹 降噪: OFF";
-    noiseBtn.className = json.noise_reduction ? "btn active-sub" : "btn";
-
-    if (!json.ready) return;
-
-    const alertBox = document.getElementById("alertBox");
-    const alertText = document.getElementById("alertText");
-    if (json.alerts && json.alerts.length > 0) {
-      alertBox.style.display = "flex";
-      alertText.innerText = json.alerts.join("  |  ");
-      speakAlert(json.alerts[0]);
-    }
-
-    const order = ["SPX", "XSP", "SPY", "QQQ"];
-    let html = "";
-
-    for (const sym of order) {
-      const d = json.data[sym];
-      if (!d) continue;
-
-      const pctColor = d.pct_change >= 0 ? "#4ade80" : "#f87171";
-      const pctSign = d.pct_change >= 0 ? "+" : "";
-
-      let rowsHtml = "";
-      for (const r of d.rows) {
-        const style = getRowStyle(r.net_gex, r.intensity);
-        const spotClass = r.is_spot ? "strike-row spot-row" : "strike-row";
-        const icons = [
-          r.is_spot ? `<span class="m-tag">M</span>` : "",
-          r.is_king ? "👑" : "",
-          r.is_call_wall ? "▲" : "",
-          r.is_put_wall ? "▼" : "",
-          r.is_flip ? "◆" : ""
-        ].join(" ");
-        const star = r.is_star ? "*" : "";
-        const rowJson = JSON.stringify(r).replace(/"/g, '&quot;');
-
-        rowsHtml += `
-          <div class="${spotClass}" style="${style}"
-               onmousemove="showTooltip(event, '${sym}', ${rowJson})"
-               onmouseleave="hideTooltip()">
-            <div class="strike-left">
-              <span>${r.strike}</span>
-              <span>${icons}</span>
-            </div>
-            <div>${formatGex(r.net_gex)}${star}</div>
-          </div>
-        `;
-      }
-
-      html += `
-        <div class="col-card">
-          <div class="col-header">
-            <div class="title-row">
-              <span>${sym} (${d.exp})</span>
-              <span>
-                $${d.spot.toFixed(2)}
-                <span class="pct-tag" style="color:${pctColor}">${pctSign}${d.pct_change.toFixed(2)}%</span>
-              </span>
-            </div>
-            <div class="pills-row">
-              <span class="pill pill-flip">◆${d.zero_flip}</span>
-              <span class="pill pill-call">▲${d.call_wall}</span>
-              <span class="pill pill-put">▼${d.put_wall}</span>
-            </div>
-          </div>
-          <div class="ladder-body">${rowsHtml}</div>
-          <div class="col-footer">
-            <span>${formatGex(d.min_neg_val)}</span>
-            <span style="font-size:10px; color:#cbd5e1;">MAX -GEX / +GEX</span>
-            <span>${formatGex(d.max_pos_val)}</span>
-          </div>
-        </div>
-      `;
-    }
-
-    if (html) {
-      document.getElementById("grid").innerHTML = html;
-    }
-  } catch (err) {
-    console.error("GEX refresh error:", err);
-  } finally {
-    isFetching = false;
-  }
-}
-
-fetchGexData();
-setInterval(fetchGexData, 2500);
-</script>
-</body>
-</html>
-"""
-
+ensure_bg_services()
 
 @app.route("/")
 def index():
-    return render_template_string(HTML_TEMPLATE)
+    ensure_bg_services()
+    return Response(HTML_PAGE, mimetype="text/html")
 
+@app.route("/api/gex")
+def api_gex():
+    ensure_bg_services()
+    return jsonify(STATE)
+
+@app.route("/api/ping")
+def api_ping():
+    return "ok", 200
+
+@app.route("/api/set_exp", methods=["POST"])
+def api_set_exp():
+    selected = request.args.get("mode", "next")
+    STATE["mode"] = selected
+    ROLLING_HISTORY.clear()
+    STATE["baseline_data"] = {}
+    refresh_all_now()
+    return jsonify({"status": "ok", "mode": STATE["mode"]})
+
+@app.route("/api/toggle_mode", methods=["POST"])
+def api_toggle_mode():
+    STATE["mode"] = "weekly" if STATE["mode"] == "next" else "next"
+    ROLLING_HISTORY.clear()
+    STATE["baseline_data"] = {}
+    refresh_all_now()
+    return jsonify({"status": "ok", "mode": STATE["mode"]})
+
+@app.route("/api/toggle_skew", methods=["POST"])
+def api_toggle_skew():
+    STATE["skew_adj"] = not STATE["skew_adj"]
+    ROLLING_HISTORY.clear()
+    STATE["baseline_data"] = {}
+    refresh_all_now()
+    return jsonify({"status": "ok", "skew_adj": STATE["skew_adj"]})
 
 if __name__ == "__main__":
-    kill_stale_port_5000()
-    t = threading.Thread(target=background_sync_worker, daemon=True)
-    t.start()
-    print("=========================================================")
-    print("🚀 XSP/SPX GEX 指挥中心 (含日/周双模秒切 + 稳态Live Flow) 已启动")
-    print("👉 请在浏览器打开: http://127.0.0.1:5000")
-    print("=========================================================")
-    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
+    generate_cloud_24h_package()
+    port = int(os.environ.get("PORT", 5050))
+    print(f"✅ 日期自由选择+盘后自动跳明日版已启动！本机请访问: http://127.0.0.1:{port}")
+    app.run(host="0.0.0.0", port=port, debug=False)
+# === END ===
