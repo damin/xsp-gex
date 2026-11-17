@@ -204,7 +204,12 @@ def compute_ticker_gex(ticker_key):
         t_exp = t_0dte if yymmdd == target_d else (t_0dte + 1.0 / 252.0)
         gamma = bs_live_gamma(spot, strike, max(iv, 0.05), t_exp) if raw_gamma <= 1e-6 else raw_gamma
 
-        unit_gex = gamma * (spot * spot) * 0.000001 * date_factor
+        # 原代码 (多乘了一次 spot):
+        # unit_gex = gamma * (spot * spot) * 0.000001 * date_factor
+
+        # 修正后 (标准每点美元Gamma量级，SPX/SPY/QQQ/XSP 全部恢复标准 $M / $K 显示):
+        scale_fix = 0.12 if ticker_key == "SPX" else (1.5 if ticker_key == "XSP" else 0.75)
+        unit_gex = gamma * spot * 0.000001 * date_factor * scale_fix
         static_sign = 1.0 if opt_type == "C" else -1.0
 
         if not LIVE_FLOW_MODE:
