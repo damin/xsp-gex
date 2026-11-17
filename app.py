@@ -12,7 +12,7 @@ app = Flask(__name__)
 
 # ==================== 全局核心开关 ====================
 SELECTED_EXP = "AUTO"     # "AUTO" = 美东16:15收盘后自动跳下一交易日 | 或指定如 "261118"
-WEEKLY_MODE = False       # False = 📅 单日模式 | True = 📆 本周OPEX(截止当周五结算日)模式
+WEEKLY_MODE = False       # False = 📅 单日视图 | True = 📆 本周OPEX视图 (后台始终双周期并行计算)
 LIVE_FLOW_MODE = True     # True = StrikeGEX动态盘口流向(增量账本稳态版) | False = 传统静态(Call正/Put负)
 NOISE_REDUCTION = True    # True = 过滤远端噪音，聚焦ATM核心博弈区
 
@@ -30,20 +30,21 @@ HEADERS = {
 }
 
 # ==================== 内存持久化状态池 ====================
-RAW_CHAIN_CACHE = {}      # 缓存经过防倒退校验的CBOE期权链
-CHAIN_VOL_STAMP = {}      # 记录每个标的最大累计成交量，拦截落后的CDN旧节点
+RAW_CHAIN_CACHE = {}      # 缓存CBOE原始期权链
+CHAIN_VOL_STAMP = {}      # CDN防倒退校验戳
 FLOW_LEDGER = {}          # 增量订单流账本: {opt_sym: {"vol": float, "signed_vol": float}}
 EMA_GEX_CACHE = {}        # 行权价级别EMA平滑缓存
-SPOT_CACHE = {}           # 持久化最新实时现价(永不回退15分钟延迟价)
+SPOT_CACHE = {}           # 实时现价缓存
 RENDER_CACHE = {}         # 前端秒读缓存
-BASELINE_MEMORY = {}      # 破位与小火箭预警记忆
-AVAIL_DATES_LIST = []     # 前端下拉框可选日期列表
-ACTIVE_AUTO_DATE = ""     # 当前 AUTO 模式实际锁定的日期 (MM-DD)
+INTRADAY_ANCHOR = {}      # 盘中主力移仓对比基准: {(ticker, target_d): {strike: day_gex, "cw": x, "pw": y}}
+ALERT_COOLDOWN = {}       # 智能语音冷却锁
+AVAIL_DATES_LIST = []
+ACTIVE_AUTO_DATE = ""
 LAST_UPDATE_STR = "同步中..."
 CACHE_LOCK = threading.Lock()
 
 
-# ==================== 0. 启动自检：自动清理占用5000端口的旧幽灵进程 ====================
+# ==================== 0. 启动自检：清理旧端口进程 ====================
 def kill_stale_port_5000():
     if os.name != "nt":
         return
@@ -59,19 +60,17 @@ def kill_stale_port_5000():
                     subprocess.run(f"taskkill /F /PID {pid}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     killed.add(pid)
         if killed:
-            print(f"🧹 已自动清理后台残留的旧端口进程 PID: {killed}，防止双进程画面闪烁！")
+            print(f"🧹 已自动清理后台残留的旧端口进程 PID: {killed}")
             time.sleep(0.5)
     except Exception:
         pass
 
 
 def get_us_eastern_now():
-    """获取美东标准时间 (EST)"""
     return datetime.now(timezone.utc) - timedelta(hours=5)
 
 
 def is_after_market_close(est_now=None):
-    """判断美东时间是否已过 16:15 期权收盘节点"""
     if est_now is None:
         est_now = get_us_eastern_now()
     return (est_now.hour > 16) or (est_now.hour == 16 and est_now.minute >= 15)
@@ -100,7 +99,17 @@ def format_yymmdd_label(yymmdd_str, today_yymmdd, after_close):
     return f"{mm_dd} {wk_str}"
 
 
-# ==================== 1. 实时现价抓取 (带持久化防回退锁) ====================
+def fmt_gex_str(val):
+    abs_v = abs(val)
+    sign = "+" if val > 0 else ("-" if val < 0 else "")
+    if abs_v >= 1.0:
+        return f"{sign}${abs_v:.1f}M"
+    if abs_v >= 0.001:
+        return f"{sign}${abs_v * 1000:.0f}K"
+    return "$0"
+
+
+# ==================== 1. 实时现价抓取 ====================
 def fetch_single_spot(key, yf_sym):
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yf_sym}?interval=1m&range=1d"
@@ -214,13 +223,11 @@ def fetch_cboe_raw_chain(ticker_key):
     if not avail_dates:
         return False
 
-    # 🔒 CDN 边缘节点防倒退锁
     prev_max_vol = CHAIN_VOL_STAMP.get(ticker_key, 0.0)
     if total_chain_vol < prev_max_vol * 0.998 and ticker_key in RAW_CHAIN_CACHE:
         return True
     CHAIN_VOL_STAMP[ticker_key] = max(prev_max_vol, total_chain_vol)
 
-    # 缓存最近 8 个到期日（足以覆盖本周五及下周五 OPEX）
     sorted_dates = sorted(list(avail_dates))[:8]
     kept_set = set(sorted_dates)
     week_opts = [item for item in filtered_opts if item[1] in kept_set]
@@ -280,14 +287,8 @@ def update_flow_ledger(week_opts, spot):
                 rec["signed_vol"] = 0.97 * rec["signed_vol"] + 0.03 * (vol * cur_sign)
 
 
-# ==================== 5. 业内标准 OPEX 周周期解析器 (截止当周五结算日) ====================
+# ==================== 5. 业内标准 OPEX 周周期解析器 ====================
 def resolve_active_dates(avail_dates, est_now):
-    """
-    返回: (target_d, active_week_dates, exp_badge_label)
-    - 周一至周四: WEEKLY 严格截止至本周五 OPEX (例如 11-18 ~ 11-20 本周)，绝不混入下周合约
-    - 周五盘中 (当 target_d 已经是周五): WEEKLY 自动延伸至下周五 (跨周展望)，避免与单日0DTE完全重复
-    - 16:15 收盘后: 自动跨日/跨周
-    """
     today_yymmdd = est_now.strftime("%y%m%d")
     after_close = is_after_market_close(est_now)
 
@@ -301,10 +302,9 @@ def resolve_active_dates(avail_dates, est_now):
             target_d = avail_dates[0]
 
     target_date_obj = yymmdd_to_date(target_d)
-    wkday = target_date_obj.weekday()  # 0=周一 ... 4=周五
+    wkday = target_date_obj.weekday()
 
     if wkday < 4:
-        # 周一至周四：严格截止到本周五期权交割日 (Friday OPEX)
         this_friday = target_date_obj + timedelta(days=(4 - wkday))
         friday_yymmdd = this_friday.strftime("%y%m%d")
         week_slice = [d for d in avail_dates if target_d <= d <= friday_yymmdd]
@@ -312,7 +312,6 @@ def resolve_active_dates(avail_dates, est_now):
             week_slice = [target_d]
         week_tag = "本周"
     else:
-        # 周五当天：单日模式已是周五OPEX，周模式自动延伸至下周五以供跨周布局参考
         next_friday = target_date_obj + timedelta(days=7)
         next_fri_yymmdd = next_friday.strftime("%y%m%d")
         week_slice = [d for d in avail_dates if target_d <= d <= next_fri_yymmdd]
@@ -335,7 +334,206 @@ def resolve_active_dates(avail_dates, est_now):
     return target_d, week_slice, exp_label
 
 
-# ==================== 6. 内存级 GEX 计算引擎 ====================
+def extract_profile_nodes(ladder_strikes, gex_map, spot, step):
+    """通用关键节点提取函数：计算任一周期的 Call Wall, Put Wall, Zero Flip, King Node, Top3极值"""
+    pos_s = [s for s in ladder_strikes if gex_map.get(s, 0.0) > 0]
+    neg_s = [s for s in ladder_strikes if gex_map.get(s, 0.0) < 0]
+    center_s = round(round(spot / step) * step, 2)
+
+    cw = max(pos_s, key=lambda s: gex_map[s]) if pos_s else round(center_s + step * 3, 2)
+    pw = min(neg_s, key=lambda s: gex_map[s]) if neg_s else round(center_s - step * 3, 2)
+    king = max(ladder_strikes, key=lambda s: abs(gex_map.get(s, 0.0))) if ladder_strikes else center_s
+
+    max_pos = max((gex_map[s] for s in pos_s), default=0.0)
+    min_neg = min((gex_map[s] for s in neg_s), default=0.0)
+    max_abs = max((abs(gex_map.get(s, 0.0)) for s in ladder_strikes), default=1.0) or 1.0
+
+    # Zero Gamma Flip
+    flip = center_s
+    min_dist = 1e9
+    for i in range(len(ladder_strikes) - 1):
+        s1, s2 = ladder_strikes[i], ladder_strikes[i + 1]
+        g1, g2 = gex_map.get(s1, 0.0), gex_map.get(s2, 0.0)
+        if (g1 >= 0 and g2 < 0) or (g1 < 0 and g2 >= 0):
+            cand = s1 if abs(g1) < abs(g2) else s2
+            if abs(cand - spot) < min_dist:
+                min_dist = abs(cand - spot)
+                flip = cand
+
+    top_pos = set(sorted(pos_s, key=lambda s: gex_map[s], reverse=True)[:3])
+    top_neg = set(sorted(neg_s, key=lambda s: gex_map[s])[:3])
+    top_abs = set(sorted(ladder_strikes, key=lambda s: abs(gex_map.get(s, 0.0)), reverse=True)[:3])
+
+    return {
+        "cw": cw, "pw": pw, "king": king, "flip": flip,
+        "max_pos": max_pos, "min_neg": min_neg, "max_abs": max_abs,
+        "top_pos": top_pos, "top_neg": top_neg, "top_abs": top_abs,
+    }
+
+
+# ==================== 6. 全动态双周期共振 + 盘中移仓算法引擎 ====================
+def analyze_dynamic_resonance_and_shifts(ticker_key, target_d, spot, step, ladder_strikes, day_map, week_map, day_meta, week_meta):
+    """
+    100% 动态算法（零硬编码点位）：
+    1. 识别【单日 vs 本周OPEX】同频共振墙 (🎯)
+    2. 识别【日黄周紫 / 日紫周黄】跨周期极性背离陷阱 (⚠️ / 🛡️)
+    3. 识别【盘中主力移仓 / 支撑蒸发 / 负Gamma真空滑梯】 (🔄 / 🟣)
+    """
+    now_ts = time.time()
+    dynamic_alerts = []
+    strike_tags = {}   # {strike: {"icon": str, "note": str}}
+
+    def trigger_voice_once(key_id, msg, cooldown=180):
+        last_t = ALERT_COOLDOWN.get(key_id, 0)
+        if now_ts - last_t > cooldown:
+            ALERT_COOLDOWN[key_id] = now_ts
+            dynamic_alerts.append(msg)
+
+    # --- A. 盘中主力移仓基准比对 (Intraday Anchor Shift) ---
+    anchor_key = (ticker_key, target_d)
+    anchor = INTRADAY_ANCHOR.get(anchor_key)
+    if anchor is None:
+        INTRADAY_ANCHOR[anchor_key] = {
+            "time": now_ts,
+            "spot": spot,
+            "cw": day_meta["cw"],
+            "pw": day_meta["pw"],
+            "gex_map": dict(day_map),
+        }
+        anchor = INTRADAY_ANCHOR[anchor_key]
+    else:
+        # 检测主力日内移仓：Call Wall 上移 或 Put Wall 下移
+        if day_meta["cw"] > anchor["cw"] and spot > anchor["spot"]:
+            trigger_voice_once(
+                f"{ticker_key}_CW_UP_{day_meta['cw']}",
+                f"🚀 {ticker_key} 主力向上移仓逼空：日内正Gamma目标墙从 {anchor['cw']} 上移至 {day_meta['cw']}！"
+            )
+            anchor["cw"] = day_meta["cw"]
+        if day_meta["pw"] < anchor["pw"] and spot < anchor["spot"]:
+            trigger_voice_once(
+                f"{ticker_key}_PW_DN_{day_meta['pw']}",
+                f"⚠️ {ticker_key} 空头向下移仓砸盘：日内负Gamma触发墙从 {anchor['pw']} 下移至 {day_meta['pw']}！"
+            )
+            anchor["pw"] = day_meta["pw"]
+
+    # --- B. 逐档扫描：双周期共振 (🎯)、日周背离 (⚠️/🛡️)、主力移仓 (🔄) ---
+    for s in ladder_strikes:
+        d_val = day_map.get(s, 0.0)
+        w_val = week_map.get(s, 0.0)
+        d_norm = abs(d_val) / day_meta["max_abs"]
+        w_norm = abs(w_val) / week_meta["max_abs"]
+        old_d_val = anchor["gex_map"].get(s, d_val)
+
+        notes = []
+        icon = ""
+
+        # 1. 双周期正 Gamma 共振 (单日与全周同为强正GEX)
+        if d_val > 0 and w_val > 0 and ((s in day_meta["top_pos"] and s in week_meta["top_pos"]) or (d_norm > 0.45 and w_norm > 0.45)):
+            icon = "🎯"
+            if s <= spot:
+                notes.append(f"🎯 双周期共振铁底：单日({fmt_gex_str(d_val)})与全周({fmt_gex_str(w_val)})多头联合护盘，回踩强支撑/空单止盈区")
+            else:
+                notes.append(f"🎯 双周期共振强阻墙：单日({fmt_gex_str(d_val)})与全周({fmt_gex_str(w_val)})共同天花板，多单分批止盈区")
+
+        # 2. 双周期负 Gamma 共振 (单日与全周同为强负GEX雷区)
+        elif d_val < 0 and w_val < 0 and ((s in day_meta["top_neg"] and s in week_meta["top_neg"]) or (d_norm > 0.45 and w_norm > 0.45)):
+            icon = "🎯"
+            notes.append(f"🎯 双周期共振空头雷区：单日({fmt_gex_str(d_val)})与全周({fmt_gex_str(w_val)})双重负Gamma磁吸靶心，跌穿加速/急杀尾声博反抽")
+
+        # 3. 日黄周紫背离陷阱 (单日正GEX，但全周为显著负GEX)
+        elif d_val > 0 and w_val < 0 and d_norm > 0.18 and w_norm > 0.22:
+            if s >= spot:
+                icon = "⚠️"
+                notes.append(f"⚠️ 日黄周紫诱多墙：单日呈正GEX({fmt_gex_str(d_val)})，但全周被负GEX({fmt_gex_str(w_val)})吞噬，谨防冲高回落假突破")
+            else:
+                # 区分：到底是单日巨量卖Put铁底(如QQQ 650)，还是脆弱薄垫(如SPY 731)
+                if s == day_meta["cw"] or d_norm > 0.75:
+                    icon = "🛡️"
+                    notes.append(f"🛡️ 日内卖Put急杀铁底：单日凝聚巨量正GEX({fmt_gex_str(d_val)})对冲全周负压({fmt_gex_str(w_val)})，日内急跌优先止盈大半空单")
+                else:
+                    icon = "⚠️"
+                    notes.append(f"⚠️ 脆弱多头薄垫：单日虽有薄垫({fmt_gex_str(d_val)})，但全周已翻紫({fmt_gex_str(w_val)})，一旦失守将触发周级别加速下跌")
+
+        # 4. 日紫周黄背离 (单日负GEX，但全周为强正GEX护盘垫)
+        elif d_val < 0 and w_val > 0 and w_norm > 0.30 and s < spot:
+            icon = "💎"
+            notes.append(f"💎 全周机构黄金护垫：单日虽偏空({fmt_gex_str(d_val)})，但全周沉淀厚实正GEX({fmt_gex_str(w_val)})，插针至此易获周线买盘托底")
+
+        # 5. 盘中主力移仓 / 护盘垫蒸发检测
+        if old_d_val > 0 and d_val < 0 and abs(d_val - old_d_val) / day_meta["max_abs"] > 0.25:
+            icon = icon or "🔄"
+            notes.append(f"🔄 盘中支撑蒸发：该行权价从开盘正GEX({fmt_gex_str(old_d_val)})被空头扫货翻紫为({fmt_gex_str(d_val)})")
+        elif abs(d_val - old_d_val) / day_meta["max_abs"] > 0.40:
+            icon = icon or "🔄"
+            dir_str = "主力增仓强化" if abs(d_val) > abs(old_d_val) else "主力平仓撤退"
+            notes.append(f"🔄 盘中移仓异动：{dir_str} ({fmt_gex_str(old_d_val)} ➔ {fmt_gex_str(d_val)})")
+
+        if notes:
+            strike_tags[s] = {"icon": icon, "note": "；".join(notes)}
+
+    # 缓慢更新锚定基准 (98% 保留初始锚定 + 2% 跟踪)，确保既能抓移仓又不过度敏感
+    for s in ladder_strikes:
+        anchor["gex_map"][s] = 0.98 * anchor["gex_map"].get(s, day_map.get(s, 0.0)) + 0.02 * day_map.get(s, 0.0)
+
+    # --- C. 实时生成每列顶部 Tactical HUD 作战指令条 ---
+    center_s = round(round(spot / step) * step, 2)
+    below_3 = [round(center_s - i * step, 2) for i in (1, 2, 3)]
+    vacuum_below = all((day_map.get(s, 0.0) < 0 and week_map.get(s, 0.0) < 0) for s in below_3)
+
+    cur_d_gex = day_map.get(center_s, 0.0)
+    cur_w_gex = week_map.get(center_s, 0.0)
+
+    # 1. 检测现价是否正在冲击“日黄周紫”诱多伏击位
+    if cur_d_gex > 0 and cur_w_gex < 0 and abs(cur_w_gex) / week_meta["max_abs"] > 0.22 and spot >= day_meta["flip"]:
+        hud = {
+            "text": f"🟠 触及 {center_s} 日黄周紫背离区(单日+{fmt_gex_str(cur_d_gex)}/全周{fmt_gex_str(cur_w_gex)})，受阻优先伏击Put",
+            "color": "#f59e0b"
+        }
+        trigger_voice_once(f"{ticker_key}_DIV_TRAP_{center_s}", f"🎯 {ticker_key} 触及 {center_s} 日黄周紫背离压制区，提防冲高回落假突破！")
+
+    # 2. 检测现价是否到达双周期下方极值决战位 / 卖Put铁底
+    elif abs(spot - day_meta["pw"]) <= step * 0.6 or abs(spot - week_meta["pw"]) <= step * 0.6:
+        target_wall = week_meta["pw"] if abs(spot - week_meta["pw"]) <= step * 0.6 else day_meta["pw"]
+        hud = {
+            "text": f"🛡️ 抵达 {target_wall}▼ 空头极值靶心！紧盯盘口止盈Put，勿在地板盲目追空",
+            "color": "#facc15"
+        }
+        trigger_voice_once(f"{ticker_key}_PW_HIT_{target_wall}", f"🎯 {ticker_key} 触及 {target_wall} 负Gamma极值靶心，注意空单分批止盈！")
+
+    elif spot < day_meta["flip"] and cur_d_gex > 0 and (center_s == day_meta["cw"] or cur_d_gex / day_meta["max_abs"] > 0.65):
+        hud = {
+            "text": f"🛡️ 触及 {center_s}👑 日内巨量正GEX护盘铁底({fmt_gex_str(cur_d_gex)})！空单果断止盈博反抽",
+            "color": "#facc15"
+        }
+        trigger_voice_once(f"{ticker_key}_IRON_BOT_{center_s}", f"🛡️ {ticker_key} 触及 {center_s} 日内主力正Gamma铁底，建议空单止盈！")
+
+    # 3. 检测现价下方是否跌入双周期连续负Gamma真空滑梯
+    elif spot < day_meta["flip"] and spot < week_meta["flip"] and vacuum_below:
+        next_support = next((s for s in ladder_strikes if s < spot and (day_map.get(s, 0.0) > 0 or week_map.get(s, 0.0) > 0)), day_meta["pw"])
+        hud = {
+            "text": f"🟣 双周期翻转轴({day_meta['flip']}◆)下方真空滑梯！顺势看空直指 {next_support}",
+            "color": "#c084fc"
+        }
+        trigger_voice_once(f"{ticker_key}_VACUUM_{center_s}", f"⚠️ {ticker_key} 处于双周期负Gamma真空滑梯，下方目标直指 {next_support}！")
+
+    # 4. 检测现价是否同时站稳单日与全周双翻转轴之上（多头顺风局）
+    elif spot >= day_meta["flip"] and spot >= week_meta["flip"]:
+        hud = {
+            "text": f"🟢 站稳日/周双翻转轴({day_meta['flip']}◆/{week_meta['flip']}◆)之上，多头顺风看向 {day_meta['cw']}▲",
+            "color": "#10b981"
+        }
+
+    # 5. 默认震荡拉锯状态
+    else:
+        hud = {
+            "text": f"⚪ 多空拉锯：上方翻转压制 {max(day_meta['flip'], week_meta['flip'])}◆ | 下方空头靶心 {day_meta['pw']}▼",
+            "color": "#94a3b8"
+        }
+
+    return strike_tags, hud, dynamic_alerts
+
+
+# ==================== 7. 内存级双周期并行 GEX 计算引擎 ====================
 def compute_ticker_gex(ticker_key, use_ema=True):
     raw = RAW_CHAIN_CACHE.get(ticker_key)
     if not raw:
@@ -359,25 +557,16 @@ def compute_ticker_gex(ticker_key, use_ema=True):
     hours_left = max(1.0, (16 - est_now.hour) + (15 - est_now.minute) / 60.0) if est_now.hour < 16 else 1.5
     t_0dte = max(hours_left / (252.0 * 6.5), 1.0 / (252.0 * 24.0))
 
-    strike_buckets = {}
+    # 同时初始化【单日桶】与【全周OPEX桶】，一次遍历完成双周期计算
+    day_buckets = {}
+    week_buckets = {}
     vol_weight = 1.35 if NOISE_REDUCTION else 0.75
 
     for sym, yymmdd, opt_type, strike, opt in raw["week_opts"]:
-        if not WEEKLY_MODE:
-            if yymmdd != target_d:
-                continue
-            date_factor = 1.0
-        else:
-            if yymmdd not in week_slice_set:
-                continue
-            # 周五 OPEX 交割日与起始目标日赋予核心全额权重 (1.0)，中间过渡日赋予 0.85 权重
-            if yymmdd == target_d or yymmdd == last_week_d:
-                date_factor = 1.0
-            else:
-                date_factor = 0.85
+        if yymmdd not in week_slice_set and yymmdd != target_d:
+            continue
 
         grid_strike = round(round(strike / step) * step, 2)
-
         oi = float(opt.get("open_interest", 0) or 0)
         vol = float(opt.get("volume", 0) or 0)
         iv = float(opt.get("iv", 0) or 0.18)
@@ -386,127 +575,133 @@ def compute_ticker_gex(ticker_key, use_ema=True):
         raw_gamma = float(opt.get("gamma", 0) or 0)
 
         days_diff = yymmdd_to_days_diff(yymmdd, today_date)
-        if days_diff == 0:
-            t_exp = t_0dte
-        else:
-            t_exp = (days_diff * 6.5 + hours_left) / (252.0 * 6.5)
-
+        t_exp = t_0dte if days_diff == 0 else (days_diff * 6.5 + hours_left) / (252.0 * 6.5)
         gamma = bs_live_gamma(spot, strike, max(iv, 0.05), t_exp) if raw_gamma <= 1e-6 else raw_gamma
 
-        unit_gex = gamma * spot * 0.000001 * date_factor
+        base_unit_gex = gamma * spot * 0.000001
         static_sign = 1.0 if opt_type == "C" else -1.0
+        ledger_rec = FLOW_LEDGER.get(sym)
+        signed_vol = ledger_rec["signed_vol"] if ledger_rec else (vol * static_sign)
+        dist_pct = abs(strike - spot) / spot
+        flow_boost = 1.85 if dist_pct <= 0.018 else 1.15
 
-        if not LIVE_FLOW_MODE:
-            eff_qty = oi + vol * vol_weight
-            gex_m = unit_gex * eff_qty * static_sign
-            flow_score = static_sign * vol
-        else:
-            base_oi_keep = 0.65 if WEEKLY_MODE else 0.42
-            oi_keep = base_oi_keep if NOISE_REDUCTION else (base_oi_keep + 0.20)
-            oi_gex = unit_gex * (oi * oi_keep) * static_sign
+        # --- 1) 填入单日桶 (Day Profile) ---
+        if yymmdd == target_d:
+            if not LIVE_FLOW_MODE:
+                d_gex = base_unit_gex * (oi + vol * vol_weight) * static_sign
+                d_flow = static_sign * vol
+            else:
+                oi_keep_d = 0.42 if NOISE_REDUCTION else 0.62
+                d_gex = base_unit_gex * (oi * oi_keep_d * static_sign + signed_vol * vol_weight * flow_boost)
+                d_flow = signed_vol
 
-            ledger_rec = FLOW_LEDGER.get(sym)
-            signed_vol = ledger_rec["signed_vol"] if ledger_rec else (vol * static_sign)
+            bd = day_buckets.get(grid_strike)
+            if bd is None:
+                bd = {"net_gex": 0.0, "call_oi": 0, "put_oi": 0, "call_vol": 0, "put_vol": 0, "flow_w": 0.0, "vol_t": 0.0}
+                day_buckets[grid_strike] = bd
+            bd["net_gex"] += d_gex
+            bd["flow_w"] += d_flow
+            bd["vol_t"] += vol
+            if opt_type == "C":
+                bd["call_oi"] += int(oi)
+                bd["call_vol"] += int(vol)
+            else:
+                bd["put_oi"] += int(oi)
+                bd["put_vol"] += int(vol)
 
-            dist_pct = abs(strike - spot) / spot
-            flow_boost = 1.85 if dist_pct <= 0.018 else 1.15
-            vol_gex = unit_gex * (signed_vol * vol_weight * flow_boost)
+        # --- 2) 填入本周OPEX桶 (Week Profile) ---
+        if yymmdd in week_slice_set:
+            w_factor = 1.0 if (yymmdd == target_d or yymmdd == last_week_d) else 0.85
+            if not LIVE_FLOW_MODE:
+                w_gex = base_unit_gex * w_factor * (oi + vol * vol_weight) * static_sign
+                w_flow = static_sign * vol
+            else:
+                oi_keep_w = 0.65 if NOISE_REDUCTION else 0.85
+                w_gex = base_unit_gex * w_factor * (oi * oi_keep_w * static_sign + signed_vol * vol_weight * flow_boost)
+                w_flow = signed_vol
 
-            gex_m = oi_gex + vol_gex
-            flow_score = signed_vol
-
-        b = strike_buckets.get(grid_strike)
-        if b is None:
-            b = {
-                "strike": grid_strike, "net_gex": 0.0,
-                "call_oi": 0, "put_oi": 0, "call_vol": 0, "put_vol": 0,
-                "flow_weighted": 0.0, "vol_total": 0.0,
-            }
-            strike_buckets[grid_strike] = b
-
-        b["net_gex"] += gex_m
-        b["flow_weighted"] += flow_score
-        b["vol_total"] += vol
-        if opt_type == "C":
-            b["call_oi"] += int(oi)
-            b["call_vol"] += int(vol)
-        else:
-            b["put_oi"] += int(oi)
-            b["put_vol"] += int(vol)
+            bw = week_buckets.get(grid_strike)
+            if bw is None:
+                bw = {"net_gex": 0.0, "call_oi": 0, "put_oi": 0, "call_vol": 0, "put_vol": 0, "flow_w": 0.0, "vol_t": 0.0}
+                week_buckets[grid_strike] = bw
+            bw["net_gex"] += w_gex
+            bw["flow_w"] += w_flow
+            bw["vol_t"] += vol
+            if opt_type == "C":
+                bw["call_oi"] += int(oi)
+                bw["call_vol"] += int(vol)
+            else:
+                bw["put_oi"] += int(oi)
+                bw["put_vol"] += int(vol)
 
     center_strike = round(round(spot / step) * step, 2)
     ladder_strikes = [round(center_strike + i * step, 2) for i in range(12, -13, -1)]
 
+    # 对单日与全周分别做 EMA 阻尼平滑
+    day_gex_map = {}
+    week_gex_map = {}
+    for s in ladder_strikes:
+        raw_d = day_buckets[s]["net_gex"] if s in day_buckets else 0.0
+        raw_w = week_buckets[s]["net_gex"] if s in week_buckets else 0.0
+
+        ema_d_key = (ticker_key, s, target_d, "DAY", LIVE_FLOW_MODE, NOISE_REDUCTION)
+        ema_w_key = (ticker_key, s, target_d, "WEEK", LIVE_FLOW_MODE, NOISE_REDUCTION)
+
+        if use_ema and ema_d_key in EMA_GEX_CACHE:
+            day_gex_map[s] = 0.75 * EMA_GEX_CACHE[ema_d_key] + 0.25 * raw_d
+        else:
+            day_gex_map[s] = raw_d
+        EMA_GEX_CACHE[ema_d_key] = day_gex_map[s]
+
+        if use_ema and ema_w_key in EMA_GEX_CACHE:
+            week_gex_map[s] = 0.75 * EMA_GEX_CACHE[ema_w_key] + 0.25 * raw_w
+        else:
+            week_gex_map[s] = raw_w
+        EMA_GEX_CACHE[ema_w_key] = week_gex_map[s]
+
+    # 提取单日与全周各自的节点特征
+    day_meta = extract_profile_nodes(ladder_strikes, day_gex_map, spot, step)
+    week_meta = extract_profile_nodes(ladder_strikes, week_gex_map, spot, step)
+
+    # 运行全动态双周期共振 & 盘中移仓分析引擎
+    strike_tags, hud, dynamic_alerts = analyze_dynamic_resonance_and_shifts(
+        ticker_key, target_d, spot, step, ladder_strikes, day_gex_map, week_gex_map, day_meta, week_meta
+    )
+
+    # 根据当前前端选择的视图 (单日 or 本周) 组装渲染行，但保留双周期透视数据
+    active_buckets = week_buckets if WEEKLY_MODE else day_buckets
+    active_map = week_gex_map if WEEKLY_MODE else day_gex_map
+    active_meta = week_meta if WEEKLY_MODE else day_meta
+
     rows = []
     for s in ladder_strikes:
-        b = strike_buckets.get(s)
-        raw_val = b["net_gex"] if b else 0.0
+        b = active_buckets.get(s)
+        val = active_map.get(s, 0.0)
+        d_val = day_gex_map.get(s, 0.0)
+        w_val = week_gex_map.get(s, 0.0)
+        tag_info = strike_tags.get(s, {"icon": "", "note": ""})
 
-        ema_key = (ticker_key, s, target_d, WEEKLY_MODE, LIVE_FLOW_MODE, NOISE_REDUCTION)
-        if use_ema and ema_key in EMA_GEX_CACHE:
-            smoothed_val = 0.75 * EMA_GEX_CACHE[ema_key] + 0.25 * raw_val
-        else:
-            smoothed_val = raw_val
-        EMA_GEX_CACHE[ema_key] = smoothed_val
-
-        if b:
-            avg_flow = (b["flow_weighted"] / b["vol_total"]) if b["vol_total"] > 0 else 0.0
-            rows.append({
-                "strike": s, "net_gex": smoothed_val,
-                "call_oi": b["call_oi"], "put_oi": b["put_oi"],
-                "call_vol": b["call_vol"], "put_vol": b["put_vol"],
-                "avg_flow": round(avg_flow, 2),
-            })
-        else:
-            rows.append({
-                "strike": s, "net_gex": 0.0,
-                "call_oi": 0, "put_oi": 0, "call_vol": 0, "put_vol": 0, "avg_flow": 0.0,
-            })
-
-    pos_rows = [r for r in rows if r["net_gex"] > 0]
-    neg_rows = [r for r in rows if r["net_gex"] < 0]
-
-    call_wall = max(pos_rows, key=lambda x: x["net_gex"])["strike"] if pos_rows else center_strike + step * 3
-    put_wall = min(neg_rows, key=lambda x: x["net_gex"])["strike"] if neg_rows else center_strike - step * 3
-    king_node = max(rows, key=lambda x: abs(x["net_gex"]))["strike"] if rows else center_strike
-
-    max_pos_val = max((r["net_gex"] for r in pos_rows), default=0.0)
-    min_neg_val = min((r["net_gex"] for r in neg_rows), default=0.0)
-
-    zero_flip = center_strike
-    min_diff = 1e9
-    for i in range(len(rows) - 1):
-        g1, g2 = rows[i]["net_gex"], rows[i + 1]["net_gex"]
-        if (g1 >= 0 and g2 < 0) or (g1 < 0 and g2 >= 0):
-            cand = rows[i]["strike"] if abs(g1) < abs(g2) else rows[i + 1]["strike"]
-            if abs(cand - spot) < min_diff:
-                min_diff = abs(cand - spot)
-                zero_flip = cand
-
-    sorted_by_abs = sorted(rows, key=lambda x: abs(x["net_gex"]), reverse=True)
-    star_strikes = {r["strike"] for r in sorted_by_abs[:3] if abs(r["net_gex"]) > 0}
-    max_abs_gex = max((abs(r["net_gex"]) for r in rows), default=1.0) or 1.0
-
-    for r in rows:
-        s = r["strike"]
-        r["is_spot"] = (abs(s - center_strike) < 1e-4)
-        r["is_king"] = (abs(s - king_node) < 1e-4)
-        r["is_call_wall"] = (abs(s - call_wall) < 1e-4)
-        r["is_put_wall"] = (abs(s - put_wall) < 1e-4)
-        r["is_flip"] = (abs(s - zero_flip) < 1e-4)
-        r["is_star"] = (s in star_strikes)
-        r["intensity"] = round(min(1.0, abs(r["net_gex"]) / max_abs_gex), 3)
-
-    alerts = []
-    base_key = (ticker_key, target_d, WEEKLY_MODE)
-    prev_state = BASELINE_MEMORY.get(base_key)
-    if prev_state:
-        if call_wall > prev_state["call_wall"] and spot > prev_state["spot"]:
-            alerts.append(f"🚀 {ticker_key} ({exp_label}) 小火箭逼空：正Gamma阻力墙上移至 {call_wall}！")
-        if spot < prev_state["put_wall"] and prev_state["spot"] >= prev_state["put_wall"]:
-            alerts.append(f"⚠️ {ticker_key} ({exp_label}) 破位警报：跌穿 {prev_state['put_wall']} 负Gamma触发位！")
-
-    BASELINE_MEMORY[base_key] = {"spot": spot, "call_wall": call_wall, "put_wall": put_wall}
+        avg_flow = (b["flow_w"] / b["vol_t"]) if (b and b["vol_t"] > 0) else 0.0
+        rows.append({
+            "strike": s,
+            "net_gex": val,
+            "day_gex": d_val,
+            "week_gex": w_val,
+            "call_oi": b["call_oi"] if b else 0,
+            "put_oi": b["put_oi"] if b else 0,
+            "call_vol": b["call_vol"] if b else 0,
+            "put_vol": b["put_vol"] if b else 0,
+            "avg_flow": round(avg_flow, 2),
+            "tac_icon": tag_info["icon"],
+            "tac_note": tag_info["note"],
+            "is_spot": (abs(s - center_strike) < 1e-4),
+            "is_king": (abs(s - active_meta["king"]) < 1e-4),
+            "is_call_wall": (abs(s - active_meta["cw"]) < 1e-4),
+            "is_put_wall": (abs(s - active_meta["pw"]) < 1e-4),
+            "is_flip": (abs(s - active_meta["flip"]) < 1e-4),
+            "is_star": (s in active_meta["top_abs"] and abs(val) > 0),
+            "intensity": round(min(1.0, abs(val) / active_meta["max_abs"]), 3),
+        })
 
     return {
         "ticker": ticker_key,
@@ -514,14 +709,15 @@ def compute_ticker_gex(ticker_key, use_ema=True):
         "target_d": target_d,
         "spot": spot,
         "pct_change": pct_change,
-        "zero_flip": zero_flip,
-        "call_wall": call_wall,
-        "put_wall": put_wall,
-        "king_node": king_node,
-        "max_pos_val": max_pos_val,
-        "min_neg_val": min_neg_val,
+        "zero_flip": active_meta["flip"],
+        "call_wall": active_meta["cw"],
+        "put_wall": active_meta["pw"],
+        "king_node": active_meta["king"],
+        "max_pos_val": active_meta["max_pos"],
+        "min_neg_val": active_meta["min_neg"],
+        "hud": hud,
         "rows": rows,
-        "alerts": alerts,
+        "alerts": dynamic_alerts,
     }
 
 
@@ -566,7 +762,7 @@ def background_sync_worker():
         time.sleep(5.0)
 
 
-# ==================== 7. Flask 极速路由 ====================
+# ==================== 8. Flask 极速路由 ====================
 @app.route("/api/gex")
 def api_gex():
     with CACHE_LOCK:
@@ -629,14 +825,14 @@ def toggle_noise():
     return jsonify({"status": "ok", "noise_reduction": NOISE_REDUCTION})
 
 
-# ==================== 8. 前端可视化界面 ====================
+# ==================== 9. 前端可视化界面 ====================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>GEX 实时量化指挥舱 (StrikeGEX Live Flow Pro)</title>
+<title>GEX 实时量化指挥舱 (动态双周期共振算法版)</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -763,6 +959,7 @@ HTML_TEMPLATE = """
     display: flex;
     gap: 6px;
     flex-wrap: wrap;
+    margin-bottom: 6px;
   }
   .pill {
     font-size: 11px;
@@ -774,6 +971,16 @@ HTML_TEMPLATE = """
   .pill-flip { color: #60a5fa; border: 1px solid #1d4ed8; }
   .pill-call { color: #facc15; border: 1px solid #a16207; }
   .pill-put  { color: #c084fc; border: 1px solid #6b21a8; }
+
+  .tactical-hud {
+    font-size: 11px;
+    font-weight: 700;
+    padding: 4px 7px;
+    border-radius: 4px;
+    background: rgba(15, 23, 42, 0.85);
+    border-left: 3px solid #38bdf8;
+    line-height: 1.35;
+  }
 
   .ladder-body { display: flex; flex-direction: column; }
   .strike-row {
@@ -802,6 +1009,10 @@ HTML_TEMPLATE = """
     padding: 0px 4px;
     border-radius: 3px;
     border: 1px solid #38bdf8;
+  }
+  .tac-dot {
+    font-size: 11px;
+    opacity: 0.95;
   }
   .col-footer {
     display: flex;
@@ -833,7 +1044,7 @@ HTML_TEMPLATE = """
     z-index: 9999;
     pointer-events: none;
     box-shadow: 0 8px 20px rgba(0,0,0,0.6);
-    min-width: 220px;
+    max-width: 300px;
   }
   .alert-banner {
     display: none;
@@ -873,7 +1084,7 @@ HTML_TEMPLATE = """
   <span style="cursor:pointer; padding:0 6px;" onclick="document.getElementById('alertBox').style.display='none'">✖</span>
 </div>
 <div id="grid" class="grid-container">
-  <div class="loading-box">⚡ 正在同步 CBOE 四标的期权链稳态快照 (约 1~2 秒)...</div>
+  <div class="loading-box">⚡ 正在启动双周期动态共振与盘中移仓雷达 (约 1~2 秒)...</div>
 </div>
 <div id="tooltip"></div>
 
@@ -944,17 +1155,22 @@ function showTooltip(e, ticker, row) {
   if (row.avg_flow > 0.12) flowDesc = "🟡 抄底/平仓护盘 (Bid主动卖盘)";
   else if (row.avg_flow < -0.12) flowDesc = "🟣 空头扫货加速 (Ask主动买盘)";
 
+  const tacHtml = row.tac_note
+    ? `<div style="margin-top:5px; padding:4px 6px; background:#1e293b; border-left:3px solid #f59e0b; color:#fde68a; font-weight:700; line-height:1.35;">${row.tac_note}</div>`
+    : "";
+
   tt.innerHTML = `
     <div style="font-weight:800; color:#38bdf8; margin-bottom:4px;">${ticker} Strike ${row.strike}</div>
-    <div>Net GEX: <b>${formatGex(row.net_gex)}</b></div>
+    <div>单日 GEX: <b>${formatGex(row.day_gex)}</b> | 本周 OPEX: <b>${formatGex(row.week_gex)}</b></div>
     <div>盘口流向: <b>${flowDesc}</b></div>
     <hr style="border:0; border-top:1px solid #334155; margin:4px 0;">
     <div>Call OI: ${row.call_oi.toLocaleString()} | Vol: ${row.call_vol.toLocaleString()}</div>
     <div>Put OI: ${row.put_oi.toLocaleString()} | Vol: ${row.put_vol.toLocaleString()}</div>
+    ${tacHtml}
   `;
   tt.style.display = "block";
-  tt.style.left = Math.min(e.clientX + 14, window.innerWidth - 230) + "px";
-  tt.style.top = Math.min(e.clientY + 14, window.innerHeight - 130) + "px";
+  tt.style.left = Math.min(e.clientX + 14, window.innerWidth - 310) + "px";
+  tt.style.top = Math.min(e.clientY + 14, window.innerHeight - 180) + "px";
 }
 
 function hideTooltip() {
@@ -1015,6 +1231,7 @@ async function fetchGexData(force = false) {
 
       const pctColor = d.pct_change >= 0 ? "#4ade80" : "#f87171";
       const pctSign = d.pct_change >= 0 ? "+" : "";
+      const hud = d.hud || { text: "动态扫描中...", color: "#38bdf8" };
 
       let rowsHtml = "";
       for (const r of d.rows) {
@@ -1025,7 +1242,8 @@ async function fetchGexData(force = false) {
           r.is_king ? "👑" : "",
           r.is_call_wall ? "▲" : "",
           r.is_put_wall ? "▼" : "",
-          r.is_flip ? "◆" : ""
+          r.is_flip ? "◆" : "",
+          r.tac_icon ? `<span class="tac-dot">${r.tac_icon}</span>` : ""
         ].join(" ");
         const star = r.is_star ? "*" : "";
         const rowJson = JSON.stringify(r).replace(/"/g, '&quot;');
@@ -1057,6 +1275,9 @@ async function fetchGexData(force = false) {
               <span class="pill pill-flip">◆${d.zero_flip}</span>
               <span class="pill pill-call">▲${d.call_wall}</span>
               <span class="pill pill-put">▼${d.put_wall}</span>
+            </div>
+            <div class="tactical-hud" style="border-left-color:${hud.color}; color:${hud.color};">
+              ${hud.text}
             </div>
           </div>
           <div class="ladder-body">${rowsHtml}</div>
@@ -1097,7 +1318,7 @@ if __name__ == "__main__":
     t = threading.Thread(target=background_sync_worker, daemon=True)
     t.start()
     print("=========================================================")
-    print("🚀 XSP/SPX GEX 指挥中心 (本周五OPEX标准周周期版) 已启动")
+    print("🚀 XSP/SPX GEX 指挥中心 (全动态双周期共振 + 盘中移仓追踪算法版) 已启动")
     print("👉 请在浏览器打开: http://127.0.0.1:5000")
     print("=========================================================")
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
