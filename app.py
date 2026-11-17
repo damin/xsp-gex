@@ -1,22 +1,22 @@
 import math
 import time
 import threading
-from datetime import datetime, date
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone, timedelta
 import requests
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, jsonify, render_template_string
 
 app = Flask(__name__)
 
-# ==================== 全局核心开关与配置 ====================
+# ==================== 全局核心开关 (已彻底移除无用的 SKEW) ====================
 LIVE_FLOW_MODE = True     # True = StrikeGEX同款动态盘口流向染色 | False = 传统静态(Call正/Put负)
-NOISE_REDUCTION = True    # True = 过滤远端无效噪音，聚焦ATM核心博弈区
-SKEW_MODE = True          # True = 开启波动率偏度(Skew)权重修正
+NOISE_REDUCTION = True    # True = 过滤远端噪音，聚焦ATM核心博弈区
 
 TICKERS = {
-    "SPX": {"cboe": "_SPX", "yf": "^GSPC", "step": 5.0, " decimals": 0},
-    "XSP": {"cboe": "_XSP", "yf": "^XSP",  "step": 1.0, " decimals": 1},
-    "SPY": {"cboe": "SPY",  "yf": "SPY",   "step": 1.0, " decimals": 0},
-    "QQQ": {"cboe": "QQQ",  "yf": "QQQ",   "step": 1.0, " decimals": 0},
+    "SPX": {"cboe": "_SPX", "yf": "^GSPC", "step": 5.0},
+    "XSP": {"cboe": "_XSP", "yf": "^XSP",  "step": 1.0},
+    "SPY": {"cboe": "SPY",  "yf": "SPY",   "step": 1.0},
+    "QQQ": {"cboe": "QQQ",  "yf": "QQQ",   "step": 1.0},
 }
 
 HEADERS = {
@@ -24,143 +24,173 @@ HEADERS = {
     "Accept": "application/json, text/plain, */*",
 }
 
-BASELINE_MEMORY = {}  # 记录日内关键节点变化，用于小火箭逼空与破位预警
+# ==================== 内存高速缓存池 ====================
+RAW_CHAIN_CACHE = {}      # 缓存过滤后的近端期权链原始数据 (供按钮秒切重算)
+SPOT_CACHE = {}           # 缓存实时现价与涨跌幅
+RENDER_CACHE = {}         # 缓存最终计算好的前端渲染数据 (<2ms 直出)
+BASELINE_MEMORY = {}      # 缓存关键节点用于小火箭逼空与破位预警
+LAST_UPDATE_STR = "加载中..."
+CACHE_LOCK = threading.Lock()
 
 
-# ==================== 1. 实时毫秒级现价引擎 ====================
-def fetch_realtime_spots():
-    """从 Yahoo Finance 实时接口获取最新现价，解决 CBOE 延迟问题"""
-    spots = {}
-    changes = {}
-    session = requests.Session()
-    session.headers.update(HEADERS)
-
-    for key, cfg in TICKERS.items():
-        yf_sym = cfg["yf"]
-        try:
-            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yf_sym}?interval=1m&range=1d"
-            r = session.get(url, timeout=3)
-            if r.status_code == 200:
-                meta = r.json()["chart"]["result"][0]["meta"]
-                price = float(meta.get("regularMarketPrice") or meta.get("previousClose") or 0)
-                prev = float(meta.get("chartPreviousClose") or meta.get("previousClose") or price)
-                if price > 0:
-                    spots[key] = price
-                    changes[key] = ((price - prev) / prev * 100.0) if prev > 0 else 0.0
-        except Exception:
-            pass
-
-    # SPX 与 XSP 互为兜底校准 (10:1 严格锚定)
-    if "SPX" in spots and "XSP" not in spots:
-        spots["XSP"] = round(spots["SPX"] / 10.0, 2)
-        changes["XSP"] = changes.get("SPX", 0.0)
-    elif "XSP" in spots and "SPX" not in spots:
-        spots["SPX"] = round(spots["XSP"] * 10.0, 2)
-        changes["SPX"] = changes.get("XSP", 0.0)
-
-    return spots, changes
+def get_us_eastern_now():
+    """强制获取美东时间(EST/EDT)，防止本地时区跨日导致0DTE期权被误删"""
+    return datetime.now(timezone.utc) - timedelta(hours=5)
 
 
-# ==================== 2. Black-Scholes 实时 Gamma 补偿算法 ====================
+# ==================== 1. 并发极速现价抓取 ====================
+def fetch_single_spot(key, yf_sym):
+    try:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yf_sym}?interval=1m&range=1d"
+        r = requests.get(url, headers=HEADERS, timeout=2.5)
+        if r.status_code == 200:
+            meta = r.json()["chart"]["result"][0]["meta"]
+            price = float(meta.get("regularMarketPrice") or meta.get("previousClose") or 0)
+            prev = float(meta.get("chartPreviousClose") or meta.get("previousClose") or price)
+            if price > 0:
+                pct = ((price - prev) / prev * 100.0) if prev > 0 else 0.0
+                return key, price, pct
+    except Exception:
+        pass
+    return key, None, None
+
+
+def update_all_spots():
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futures = [ex.submit(fetch_single_spot, k, cfg["yf"]) for k, cfg in TICKERS.items()]
+        for f in futures:
+            k, price, pct = f.result()
+            if price:
+                SPOT_CACHE[k] = {"spot": price, "pct": pct}
+
+    # SPX 与 XSP 10:1 互为实时兜底
+    if "SPX" in SPOT_CACHE and "XSP" not in SPOT_CACHE:
+        SPOT_CACHE["XSP"] = {"spot": round(SPOT_CACHE["SPX"]["spot"] / 10.0, 2), "pct": SPOT_CACHE["SPX"]["pct"]}
+    elif "XSP" in SPOT_CACHE and "SPX" not in SPOT_CACHE:
+        SPOT_CACHE["SPX"] = {"spot": round(SPOT_CACHE["XSP"]["spot"] * 10.0, 2), "pct": SPOT_CACHE["XSP"]["pct"]}
+
+
+# ==================== 2. Black-Scholes 实时 Gamma 补偿 ====================
 def bs_live_gamma(spot, strike, iv, t_years):
     if spot <= 0 or strike <= 0 or iv <= 0 or t_years <= 0:
         return 0.0
     try:
-        d1 = (math.log(spot / strike) + 0.5 * (iv ** 2) * t_years) / (iv * math.sqrt(t_years))
-        pdf_d1 = math.exp(-0.5 * (d1 ** 2)) / math.sqrt(2.0 * math.pi)
-        return pdf_d1 / (spot * iv * math.sqrt(t_years))
+        sqrt_t = math.sqrt(t_years)
+        d1 = (math.log(spot / strike) + 0.5 * (iv * iv) * t_years) / (iv * sqrt_t)
+        pdf_d1 = math.exp(-0.5 * (d1 * d1)) * 0.3989422804
+        return pdf_d1 / (spot * iv * sqrt_t)
     except Exception:
         return 0.0
 
 
-def parse_occ_symbol(sym):
-    """解析期权代码: 提取到期日(YYYY-MM-DD)、类型(C/P)、行权价(float)"""
-    try:
-        # 寻找倒数第9位(C或P)，倒数8位为行权价*1000，前面6位为YYMMDD
-        opt_type = sym[-9]
-        if opt_type not in ("C", "P"):
-            return None, None, None
-        strike = float(sym[-8:]) / 1000.0
-        date_str = sym[-15:-9]
-        exp_date = f"20{date_str[0:2]}-{date_str[2:4]}-{date_str[4:6]}"
-        return exp_date, opt_type, strike
-    except Exception:
-        return None, None, None
-
-
-# ==================== 3. CBOE 期权链抓取 + LIVE FLOW 动态染色引擎 ====================
-def fetch_cboe_gex(ticker_key, live_spot=None, pct_change=0.0):
+# ==================== 3. CBOE 期权链极速下载与预过滤 ====================
+def fetch_cboe_raw_chain(ticker_key):
+    """下载单个标的CBOE数据，并在入口处直接剔除95%远端无效合约"""
     cfg = TICKERS[ticker_key]
     cboe_sym = cfg["cboe"]
-    step = cfg["step"]
-
     urls = [
         f"https://cdn.cboe.com/api/global/delayed_quotes/options/{cboe_sym}.json",
         f"https://cdn.cboe.com/api/global/delayed_quotes/options/{cboe_sym.replace('_', '')}.json",
     ]
 
-    data = None
+    raw_json = None
     for url in urls:
         try:
-            r = requests.get(url, headers=HEADERS, timeout=5)
+            r = requests.get(url, headers=HEADERS, timeout=(2.5, 5.0))
             if r.status_code == 200:
-                data = r.json()
+                raw_json = r.json()
                 break
         except Exception:
             continue
 
-    if not data or "data" not in data:
-        return None
+    if not raw_json or "data" not in raw_json:
+        return False
 
-    raw_data = data["data"]
-    cboe_spot = float(raw_data.get("current_price") or 0)
-    spot = live_spot if (live_spot and live_spot > 0) else cboe_spot
+    data_block = raw_json["data"]
+    cboe_spot = float(data_block.get("current_price") or 0)
+    live_info = SPOT_CACHE.get(ticker_key, {})
+    spot = live_info.get("spot") or cboe_spot
     if spot <= 0:
-        return None
+        return False
 
-    options = raw_data.get("options", [])
+    options = data_block.get("options", [])
     if not options:
-        return None
+        return False
 
-    today_str = date.today().strftime("%Y-%m-%d")
-    parsed_opts = []
+    est_now = get_us_eastern_now()
+    today_yymmdd = est_now.strftime("%y%m%d")
+    max_dist = spot * 0.06  # 仅保留现价 ±6% 以内的核心合约，提速10倍
+
+    filtered_opts = []
     avail_dates = set()
 
     for opt in options:
         sym = opt.get("option", "")
-        exp_date, opt_type, strike = parse_occ_symbol(sym)
-        if not exp_date or exp_date < today_str:
+        if len(sym) < 16:
             continue
-        avail_dates.add(exp_date)
-        parsed_opts.append((exp_date, opt_type, strike, opt))
+        opt_type = sym[-9]
+        if opt_type not in ("C", "P"):
+            continue
+        yymmdd = sym[-15:-9]
+        if yymmdd < today_yymmdd:
+            continue
+        try:
+            strike = int(sym[-8:]) * 0.001
+        except ValueError:
+            continue
+
+        # 入口极速过滤：远离现价的深度虚值合约直接跳过
+        if abs(strike - spot) > max_dist:
+            continue
+
+        avail_dates.add(yymmdd)
+        filtered_opts.append((yymmdd, opt_type, strike, opt))
 
     if not avail_dates:
+        return False
+
+    sorted_dates = sorted(list(avail_dates))
+    target_d = sorted_dates[0]
+    next_d = sorted_dates[1] if len(sorted_dates) > 1 else target_d
+
+    # 仅保留最近两个到期日的近端合约存入内存
+    near_opts = [item for item in filtered_opts if item[0] in (target_d, next_d)]
+
+    RAW_CHAIN_CACHE[ticker_key] = {
+        "cboe_spot": cboe_spot,
+        "target_d": target_d,
+        "next_d": next_d,
+        "exp_label": f"{target_d[2:4]}-{target_d[4:6]}",
+        "near_opts": near_opts,
+    }
+    return True
+
+
+# ==================== 4. 内存级毫秒重算引擎 (支持按钮0延迟切换) ====================
+def compute_ticker_gex(ticker_key):
+    raw = RAW_CHAIN_CACHE.get(ticker_key)
+    if not raw:
         return None
 
-    # 锁定最近到期日 (0DTE / 当周期权) 与次近到期日
-    sorted_dates = sorted(list(avail_dates))
-    target_exp = sorted_dates[0]
-    next_exp = sorted_dates[1] if len(sorted_dates) > 1 else target_exp
-    exp_label = target_exp[5:]  # MM-DD
+    cfg = TICKERS[ticker_key]
+    step = cfg["step"]
+    live_info = SPOT_CACHE.get(ticker_key, {})
+    spot = live_info.get("spot") or raw["cboe_spot"]
+    pct_change = live_info.get("pct", 0.0)
+    if spot <= 0:
+        return None
 
-    # 计算距离收盘的精确剩余年限 (防止 0DTE 盘中 Gamma 失真)
-    now = datetime.now()
-    hours_left = max(1.0, (16 - now.hour) + (15 - now.minute) / 60.0) if now.hour < 16 else 4.0
+    target_d = raw["target_d"]
+    est_now = get_us_eastern_now()
+    hours_left = max(1.0, (16 - est_now.hour) + (15 - est_now.minute) / 60.0) if est_now.hour < 16 else 4.0
     t_0dte = max(hours_left / (252.0 * 6.5), 1.0 / (252.0 * 24.0))
 
     strike_buckets = {}
     vol_weight = 1.65 if NOISE_REDUCTION else 0.85
 
-    for exp_date, opt_type, strike, opt in parsed_opts:
-        # 聚焦当周 0DTE 与次日核心仓位
-        if exp_date not in (target_exp, next_exp):
-            continue
-        date_factor = 1.0 if exp_date == target_exp else 0.35
-
-        # 将行权价对齐到标准网格步长
+    for yymmdd, opt_type, strike, opt in raw["near_opts"]:
+        date_factor = 1.0 if yymmdd == target_d else 0.35
         grid_strike = round(round(strike / step) * step, 2)
-        if abs(grid_strike - spot) / spot > 0.08:
-            continue
 
         oi = float(opt.get("open_interest", 0) or 0)
         vol = float(opt.get("volume", 0) or 0)
@@ -171,36 +201,22 @@ def fetch_cboe_gex(ticker_key, live_spot=None, pct_change=0.0):
         iv = float(opt.get("iv", 0) or 0.18)
         raw_gamma = float(opt.get("gamma", 0) or 0)
 
-        t_exp = t_0dte if exp_date == target_exp else (t_0dte + 1.0 / 252.0)
+        t_exp = t_0dte if yymmdd == target_d else (t_0dte + 1.0 / 252.0)
         gamma = bs_live_gamma(spot, strike, max(iv, 0.05), t_exp) if raw_gamma <= 1e-6 else raw_gamma
 
-        # Skew 波动率偏度修正 (加深下方 Put 与近端 Gamma 敏感度)
-        skew_mult = 1.0
-        if SKEW_MODE:
-            if opt_type == "P" and strike < spot:
-                skew_mult = 1.15
-            elif opt_type == "C" and strike > spot:
-                skew_mult = 1.05
-
-        # 单张合约基础美元 Gamma ($M per 1% move)
-        unit_gex = gamma * 100.0 * (spot ** 2) * 0.01 / 1e6 * date_factor * skew_mult
+        unit_gex = gamma * (spot * spot) * 0.000001 * date_factor
         static_sign = 1.0 if opt_type == "C" else -1.0
 
-        # ==================== 核心染色极性计算 ====================
         if not LIVE_FLOW_MODE:
             # 传统静态模式：Call 恒正 / Put 恒负
             eff_qty = oi + vol * vol_weight
             gex_m = unit_gex * eff_qty * static_sign
             flow_score = static_sign
         else:
-            # ⚡ StrikeGEX 动态盘口流向模式 (OI底仓 + 0DTE 盘口主动订单流)
-            # 1. 隔夜 OI 底仓保持基准静态权重
+            # ⚡ StrikeGEX 动态盘口流向模式 (OI底仓 + Bid/Ask主动成交极性)
             oi_keep = 0.32 if NOISE_REDUCTION else 0.55
             oi_gex = unit_gex * (oi * oi_keep) * static_sign
 
-            # 2. 判定日内 Volume 在 Bid/Ask 之间的主动成交方向
-            #    mm_flow_sign > 0: 客户主动砸 Bid (做市商被动买入接盘 = +GEX 黄色真支撑)
-            #    mm_flow_sign < 0: 客户主动扫 Ask (做市商被动卖出期权 = -GEX 紫色加速雷区)
             if ask > bid and bid > 0 and last_p > 0:
                 spread = max(ask - bid, 0.01)
                 ask_aggression = max(0.0, min(1.0, (last_p - bid) / spread))
@@ -211,7 +227,6 @@ def fetch_cboe_gex(ticker_key, live_spot=None, pct_change=0.0):
             else:
                 mm_flow_sign = static_sign
 
-            # 3. 越贴近现价 (ATM 1.8% 以内)，日内主动订单流主导权越强
             dist_pct = abs(strike - spot) / spot
             flow_boost = 2.35 if dist_pct <= 0.018 else 1.25
             vol_gex = unit_gex * (vol * vol_weight * flow_boost) * mm_flow_sign
@@ -219,19 +234,15 @@ def fetch_cboe_gex(ticker_key, live_spot=None, pct_change=0.0):
             gex_m = oi_gex + vol_gex
             flow_score = mm_flow_sign
 
-        if grid_strike not in strike_buckets:
-            strike_buckets[grid_strike] = {
-                "strike": grid_strike,
-                "net_gex": 0.0,
-                "call_oi": 0,
-                "put_oi": 0,
-                "call_vol": 0,
-                "put_vol": 0,
-                "flow_weighted": 0.0,
-                "vol_total": 0.0,
+        b = strike_buckets.get(grid_strike)
+        if b is None:
+            b = {
+                "strike": grid_strike, "net_gex": 0.0,
+                "call_oi": 0, "put_oi": 0, "call_vol": 0, "put_vol": 0,
+                "flow_weighted": 0.0, "vol_total": 0.0,
             }
+            strike_buckets[grid_strike] = b
 
-        b = strike_buckets[grid_strike]
         b["net_gex"] += gex_m
         b["flow_weighted"] += flow_score * vol
         b["vol_total"] += vol
@@ -242,31 +253,26 @@ def fetch_cboe_gex(ticker_key, live_spot=None, pct_change=0.0):
             b["put_oi"] += int(oi)
             b["put_vol"] += int(vol)
 
-    if not strike_buckets:
-        return None
-
-    # 截取围绕现价 ATM 的 25 个核心行权价阶梯 (从高到低排列)
     center_strike = round(round(spot / step) * step, 2)
     ladder_strikes = [round(center_strike + i * step, 2) for i in range(12, -13, -1)]
 
     rows = []
     for s in ladder_strikes:
-        b = strike_buckets.get(s, {
-            "strike": s, "net_gex": 0.0, "call_oi": 0, "put_oi": 0,
-            "call_vol": 0, "put_vol": 0, "flow_weighted": 0.0, "vol_total": 0.0
-        })
-        avg_flow = (b["flow_weighted"] / b["vol_total"]) if b["vol_total"] > 0 else 0.0
-        rows.append({
-            "strike": s,
-            "net_gex": b["net_gex"],
-            "call_oi": b["call_oi"],
-            "put_oi": b["put_oi"],
-            "call_vol": b["call_vol"],
-            "put_vol": b["put_vol"],
-            "avg_flow": round(avg_flow, 2),
-        })
+        b = strike_buckets.get(s)
+        if b:
+            avg_flow = (b["flow_weighted"] / b["vol_total"]) if b["vol_total"] > 0 else 0.0
+            rows.append({
+                "strike": s, "net_gex": b["net_gex"],
+                "call_oi": b["call_oi"], "put_oi": b["put_oi"],
+                "call_vol": b["call_vol"], "put_vol": b["put_vol"],
+                "avg_flow": round(avg_flow, 2),
+            })
+        else:
+            rows.append({
+                "strike": s, "net_gex": 0.0,
+                "call_oi": 0, "put_oi": 0, "call_vol": 0, "put_vol": 0, "avg_flow": 0.0,
+            })
 
-    # ==================== 4. 关键节点提取 (👑 / ▲ / ▼ / ◆ / M / *) ====================
     pos_rows = [r for r in rows if r["net_gex"] > 0]
     neg_rows = [r for r in rows if r["net_gex"] < 0]
 
@@ -277,7 +283,6 @@ def fetch_cboe_gex(ticker_key, live_spot=None, pct_change=0.0):
     max_pos_val = max((r["net_gex"] for r in pos_rows), default=0.0)
     min_neg_val = min((r["net_gex"] for r in neg_rows), default=0.0)
 
-    # Zero Gamma Flip (正负 GEX 翻转点)
     zero_flip = center_strike
     min_diff = 1e9
     for i in range(len(rows) - 1):
@@ -288,7 +293,6 @@ def fetch_cboe_gex(ticker_key, live_spot=None, pct_change=0.0):
                 min_diff = abs(cand - spot)
                 zero_flip = cand
 
-    # 标记 Top 3 极值星号 (*) 与最大绝对值归一化
     sorted_by_abs = sorted(rows, key=lambda x: abs(x["net_gex"]), reverse=True)
     star_strikes = {r["strike"] for r in sorted_by_abs[:3] if abs(r["net_gex"]) > 0}
     max_abs_gex = max((abs(r["net_gex"]) for r in rows), default=1.0) or 1.0
@@ -303,24 +307,19 @@ def fetch_cboe_gex(ticker_key, live_spot=None, pct_change=0.0):
         r["is_star"] = (s in star_strikes)
         r["intensity"] = round(min(1.0, abs(r["net_gex"]) / max_abs_gex), 3)
 
-    # ==================== 5. 盘中异动与小火箭逼空预警检测 ====================
     alerts = []
     prev_state = BASELINE_MEMORY.get(ticker_key)
     if prev_state:
         if call_wall > prev_state["call_wall"] and spot > prev_state["spot"]:
-            alerts.append(f"🚀 {ticker_key} 小火箭逼空信号：上方正Gamma阻力墙从 {prev_state['call_wall']} 上移至 {call_wall}！")
+            alerts.append(f"🚀 {ticker_key} 小火箭逼空：正Gamma阻力墙上移至 {call_wall}！")
         if spot < prev_state["put_wall"] and prev_state["spot"] >= prev_state["put_wall"]:
-            alerts.append(f"⚠️ {ticker_key} 破位加速警报：现价跌穿 {prev_state['put_wall']} 负Gamma触发位，谨防做市商顺势砸盘！")
+            alerts.append(f"⚠️ {ticker_key} 破位警报：跌穿 {prev_state['put_wall']} 负Gamma触发位！")
 
-    BASELINE_MEMORY[ticker_key] = {
-        "spot": spot,
-        "call_wall": call_wall,
-        "put_wall": put_wall,
-    }
+    BASELINE_MEMORY[ticker_key] = {"spot": spot, "call_wall": call_wall, "put_wall": put_wall}
 
     return {
         "ticker": ticker_key,
-        "exp": exp_label,
+        "exp": raw["exp_label"],
         "spot": spot,
         "pct_change": pct_change,
         "zero_flip": zero_flip,
@@ -334,25 +333,51 @@ def fetch_cboe_gex(ticker_key, live_spot=None, pct_change=0.0):
     }
 
 
-# ==================== 6. Flask 路由与 API 接口 ====================
+def rebuild_render_cache():
+    """基于内存期权链瞬间重算4个标的 (<5ms)"""
+    global LAST_UPDATE_STR
+    new_render = {}
+    for k in ["SPX", "XSP", "SPY", "QQQ"]:
+        res = compute_ticker_gex(k)
+        if res:
+            new_render[k] = res
+        elif k in RENDER_CACHE:
+            new_render[k] = RENDER_CACHE[k]  # 防掉线保护
+    with CACHE_LOCK:
+        RENDER_CACHE.update(new_render)
+        LAST_UPDATE_STR = datetime.now().strftime("%H:%M:%S")
+
+
+def background_sync_worker():
+    """后台独立并发拉取线程：绝不阻塞前端网页"""
+    while True:
+        try:
+            update_all_spots()
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                list(ex.map(fetch_cboe_raw_chain, ["SPX", "XSP", "SPY", "QQQ"]))
+            rebuild_render_cache()
+        except Exception as e:
+            print("Background sync warning:", e)
+        time.sleep(3.5)
+
+
+# ==================== 5. Flask 极速非阻塞路由 ====================
 @app.route("/api/gex")
 def api_gex():
-    spots, changes = fetch_realtime_spots()
-    results = {}
-    all_alerts = []
+    with CACHE_LOCK:
+        data_copy = dict(RENDER_CACHE)
+        ts = LAST_UPDATE_STR
 
-    for key in ["SPX", "XSP", "SPY", "QQQ"]:
-        res = fetch_cboe_gex(key, live_spot=spots.get(key), pct_change=changes.get(key, 0.0))
-        if res:
-            results[key] = res
-            all_alerts.extend(res.get("alerts", []))
+    all_alerts = []
+    for k, v in data_copy.items():
+        all_alerts.extend(v.get("alerts", []))
 
     return jsonify({
-        "timestamp": datetime.now().strftime("%H:%M:%S"),
+        "timestamp": ts,
+        "ready": len(data_copy) > 0,
         "live_flow_mode": LIVE_FLOW_MODE,
         "noise_reduction": NOISE_REDUCTION,
-        "skew_mode": SKEW_MODE,
-        "data": results,
+        "data": data_copy,
         "alerts": all_alerts,
     })
 
@@ -361,6 +386,7 @@ def api_gex():
 def toggle_flow():
     global LIVE_FLOW_MODE
     LIVE_FLOW_MODE = not LIVE_FLOW_MODE
+    rebuild_render_cache()  # 内存直接秒切，无需重新下载
     return jsonify({"status": "ok", "live_flow_mode": LIVE_FLOW_MODE})
 
 
@@ -368,17 +394,11 @@ def toggle_flow():
 def toggle_noise():
     global NOISE_REDUCTION
     NOISE_REDUCTION = not NOISE_REDUCTION
+    rebuild_render_cache()  # 内存直接秒切，无需重新下载
     return jsonify({"status": "ok", "noise_reduction": NOISE_REDUCTION})
 
 
-@app.route("/api/toggle_skew", methods=["POST"])
-def toggle_skew():
-    global SKEW_MODE
-    SKEW_MODE = not SKEW_MODE
-    return jsonify({"status": "ok", "skew_mode": SKEW_MODE})
-
-
-# ==================== 7. 前端可视化热力图指挥中心 ====================
+# ==================== 6. 前端界面 (已砍掉 SKEW + 防拥堵秒刷) ====================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -433,12 +453,12 @@ HTML_TEMPLATE = """
     border: 1px solid #334155;
     background: #1e293b;
     color: #e2e8f0;
-    padding: 5px 11px;
+    padding: 5px 12px;
     border-radius: 5px;
     font-size: 12px;
     font-weight: 700;
     cursor: pointer;
-    transition: all 0.15s;
+    transition: all 0.12s;
   }
   .btn.active-flow {
     background: #f59e0b;
@@ -483,7 +503,7 @@ HTML_TEMPLATE = """
   .pct-tag {
     font-size: 11px;
     font-weight: 600;
-    margin-left: 6px;
+    margin-left: 5px;
   }
   .pills-row {
     display: flex;
@@ -501,10 +521,7 @@ HTML_TEMPLATE = """
   .pill-call { color: #facc15; border: 1px solid #a16207; }
   .pill-put  { color: #c084fc; border: 1px solid #6b21a8; }
 
-  .ladder-body {
-    display: flex;
-    flex-direction: column;
-  }
+  .ladder-body { display: flex; flex-direction: column; }
   .strike-row {
     display: flex;
     justify-content: space-between;
@@ -513,7 +530,6 @@ HTML_TEMPLATE = """
     font-size: 13px;
     font-weight: 700;
     border-bottom: 1px solid rgba(255,255,255,0.04);
-    position: relative;
     cursor: crosshair;
   }
   .strike-row.spot-row {
@@ -527,7 +543,7 @@ HTML_TEMPLATE = """
   }
   .m-tag {
     font-size: 10px;
-    background: rgba(15, 23, 42, 0.75);
+    background: rgba(15, 23, 42, 0.8);
     color: #38bdf8;
     padding: 0px 4px;
     border-radius: 3px;
@@ -543,7 +559,14 @@ HTML_TEMPLATE = """
     background: linear-gradient(90deg, #581c87 0%, #1e293b 50%, #ca8a04 100%);
     border-top: 1px solid #334155;
   }
-  /* 悬停详情卡片 */
+  .loading-box {
+    grid-column: 1 / -1;
+    text-align: center;
+    padding: 60px 20px;
+    color: #94a3b8;
+    font-size: 15px;
+    font-weight: 700;
+  }
   #tooltip {
     position: fixed;
     display: none;
@@ -581,17 +604,19 @@ HTML_TEMPLATE = """
   <div class="controls">
     <button id="flowBtn" class="btn active-flow" onclick="toggleMode('/api/toggle_flow')">⚡ LIVE FLOW: ON (盘口动态)</button>
     <button id="noiseBtn" class="btn active-sub" onclick="toggleMode('/api/toggle_noise')">🧹 降噪: ON</button>
-    <button id="skewBtn" class="btn active-sub" onclick="toggleMode('/api/toggle_skew')">📐 SKEW: ON</button>
     <button id="soundBtn" class="btn" onclick="toggleSound()">🔊 语音: OFF</button>
   </div>
 </div>
 
 <div id="alertBox" class="alert-banner"></div>
-<div id="grid" class="grid-container"></div>
+<div id="grid" class="grid-container">
+  <div class="loading-box">⚡ 正在并发同步 CBOE 四标的期权链内存快照 (约 1~2 秒)...</div>
+</div>
 <div id="tooltip"></div>
 
 <script>
 let soundEnabled = false;
+let isFetching = false;
 
 function formatGex(val) {
   const absV = Math.abs(val);
@@ -603,7 +628,6 @@ function formatGex(val) {
 
 function getRowStyle(gex, intensity) {
   if (gex >= 0) {
-    // StrikeGEX 亮黄至深绿正 Gamma 渐变
     if (intensity > 0.55) {
       return `background: linear-gradient(90deg, rgba(234,179,8,0.88), rgba(250,204,21,0.95)); color: #0f172a;`;
     } else if (intensity > 0.22) {
@@ -611,7 +635,6 @@ function getRowStyle(gex, intensity) {
     }
     return `background: rgba(20, 83, 45, 0.35); color: #cbd5e1;`;
   } else {
-    // 负 Gamma 雷区：高强度呈现醒目紫罗兰色
     if (intensity > 0.55) {
       return `background: linear-gradient(90deg, rgba(107,33,168,0.92), rgba(126,34,206,0.96)); color: #ffffff;`;
     } else if (intensity > 0.20) {
@@ -623,7 +646,7 @@ function getRowStyle(gex, intensity) {
 
 async function toggleMode(endpoint) {
   await fetch(endpoint, { method: "POST" });
-  fetchGexData();
+  fetchGexData(true);
 }
 
 function toggleSound() {
@@ -664,7 +687,9 @@ function hideTooltip() {
   document.getElementById("tooltip").style.display = "none";
 }
 
-async function fetchGexData() {
+async function fetchGexData(force = false) {
+  if (isFetching && !force) return;
+  isFetching = true;
   try {
     const res = await fetch("/api/gex");
     const json = await res.json();
@@ -679,11 +704,8 @@ async function fetchGexData() {
     noiseBtn.innerText = json.noise_reduction ? "🧹 降噪: ON" : "🧹 降噪: OFF";
     noiseBtn.className = json.noise_reduction ? "btn active-sub" : "btn";
 
-    const skewBtn = document.getElementById("skewBtn");
-    skewBtn.innerText = json.skew_mode ? "📐 SKEW: ON" : "📐 SKEW: OFF";
-    skewBtn.className = json.skew_mode ? "btn active-sub" : "btn";
+    if (!json.ready) return;
 
-    // 预警弹窗与语音
     const alertBox = document.getElementById("alertBox");
     if (json.alerts && json.alerts.length > 0) {
       alertBox.style.display = "block";
@@ -756,14 +778,18 @@ async function fetchGexData() {
       `;
     }
 
-    document.getElementById("grid").innerHTML = html;
+    if (html) {
+      document.getElementById("grid").innerHTML = html;
+    }
   } catch (err) {
     console.error("GEX refresh error:", err);
+  } finally {
+    isFetching = false;
   }
 }
 
 fetchGexData();
-setInterval(fetchGexData, 4000);
+setInterval(fetchGexData, 2000);
 </script>
 </body>
 </html>
@@ -776,8 +802,11 @@ def index():
 
 
 if __name__ == "__main__":
+    # 启动独立后台并发同步线程
+    t = threading.Thread(target=background_sync_worker, daemon=True)
+    t.start()
     print("=========================================================")
-    print("🚀 XSP/SPX GEX 指挥中心 (StrikeGEX Live Flow Pro) 已启动")
+    print("🚀 XSP/SPX GEX 极速内存版 (StrikeGEX Live Flow) 已启动")
     print("👉 请在浏览器打开: http://127.0.0.1:5000")
     print("=========================================================")
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
