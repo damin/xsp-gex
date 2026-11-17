@@ -4,13 +4,14 @@ import math
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 import requests
 from flask import Flask, jsonify, render_template_string
 
 app = Flask(__name__)
 
 # ==================== 全局核心开关 ====================
+WEEKLY_MODE = False       # False = 📅 当日(0DTE)模式 | True = 📆 全周(WEEKLY 5到期日聚合)模式
 LIVE_FLOW_MODE = True     # True = StrikeGEX动态盘口流向(增量账本稳态版) | False = 传统静态(Call正/Put负)
 NOISE_REDUCTION = True    # True = 过滤远端噪音，聚焦ATM核心博弈区
 
@@ -27,11 +28,11 @@ HEADERS = {
     "Cache-Control": "no-cache",
 }
 
-# ==================== 内存持久化状态池 (防闪烁/防回退) ====================
-RAW_CHAIN_CACHE = {}      # 缓存经过防倒退校验的CBOE期权链
+# ==================== 内存持久化状态池 (防闪烁/防回退/秒切周日模式) ====================
+RAW_CHAIN_CACHE = {}      # 缓存经过防倒退校验的CBOE期权链 (含未来5个到期日全周数据)
 CHAIN_VOL_STAMP = {}      # 记录每个标的最大累计成交量，拦截落后的CDN旧节点
 FLOW_LEDGER = {}          # 增量订单流账本: {opt_sym: {"vol": float, "signed_vol": float}}
-EMA_GEX_CACHE = {}        # 行权价级别EMA平滑缓存: {(ticker, strike): float}
+EMA_GEX_CACHE = {}        # 行权价级别EMA平滑缓存
 SPOT_CACHE = {}           # 持久化最新实时现价(永不回退15分钟延迟价)
 RENDER_CACHE = {}         # 前端秒读缓存
 BASELINE_MEMORY = {}      # 破位与小火箭预警记忆
@@ -65,6 +66,16 @@ def get_us_eastern_now():
     return datetime.now(timezone.utc) - timedelta(hours=5)
 
 
+def yymmdd_to_days_diff(yymmdd_str, today_date):
+    try:
+        y = 2000 + int(yymmdd_str[0:2])
+        m = int(yymmdd_str[2:4])
+        d = int(yymmdd_str[4:6])
+        return max(0, (date(y, m, d) - today_date).days)
+    except Exception:
+        return 1
+
+
 # ==================== 1. 实时现价抓取 (带持久化防回退锁) ====================
 def fetch_single_spot(key, yf_sym):
     try:
@@ -90,7 +101,6 @@ def update_all_spots():
             if price and price > 0:
                 SPOT_CACHE[k] = {"spot": price, "pct": pct}
 
-    # SPX 与 XSP 互为实时镜像兜底
     if "SPX" in SPOT_CACHE and "XSP" not in SPOT_CACHE:
         SPOT_CACHE["XSP"] = {"spot": round(SPOT_CACHE["SPX"]["spot"] / 10.0, 2), "pct": SPOT_CACHE["SPX"]["pct"]}
     elif "XSP" in SPOT_CACHE and "SPX" not in SPOT_CACHE:
@@ -110,11 +120,10 @@ def bs_live_gamma(spot, strike, iv, t_years):
         return 0.0
 
 
-# ==================== 3. CBOE 期权链拉取 (带 CDN 防时光倒流校验) ====================
+# ==================== 3. CBOE 期权链拉取 (预缓存未来5个到期日以支持周/日秒切) ====================
 def fetch_cboe_raw_chain(ticker_key):
     cfg = TICKERS[ticker_key]
     cboe_sym = cfg["cboe"]
-    # 固定优先使用主CDN路径，带时间戳桶减少跨节点乱跳
     ts_bucket = int(time.time() // 5)
     urls = [
         f"https://cdn.cboe.com/api/global/delayed_quotes/options/{cboe_sym}.json?_={ts_bucket}",
@@ -136,7 +145,6 @@ def fetch_cboe_raw_chain(ticker_key):
 
     data_block = raw_json["data"]
     cboe_spot = float(data_block.get("current_price") or 0)
-    # 只要 SPOT_CACHE 有实时价，永远优先用实时价，绝不退回15分钟延迟的 cboe_spot
     if ticker_key not in SPOT_CACHE and cboe_spot > 0:
         SPOT_CACHE[ticker_key] = {"spot": cboe_spot, "pct": 0.0}
 
@@ -150,7 +158,7 @@ def fetch_cboe_raw_chain(ticker_key):
 
     est_now = get_us_eastern_now()
     today_yymmdd = est_now.strftime("%y%m%d")
-    max_dist = spot * 0.06
+    max_dist = spot * 0.065
 
     filtered_opts = []
     avail_dates = set()
@@ -182,7 +190,7 @@ def fetch_cboe_raw_chain(ticker_key):
     if not avail_dates:
         return False
 
-    # 🔒 CDN 边缘节点防倒退锁：如果本次拉取的快照总成交量小于已缓存快照，说明命中了落后的旧CDN节点，直接丢弃！
+    # 🔒 CDN 边缘节点防倒退锁
     prev_max_vol = CHAIN_VOL_STAMP.get(ticker_key, 0.0)
     if total_chain_vol < prev_max_vol * 0.998 and ticker_key in RAW_CHAIN_CACHE:
         return True
@@ -191,60 +199,63 @@ def fetch_cboe_raw_chain(ticker_key):
     sorted_dates = sorted(list(avail_dates))
     target_d = sorted_dates[0]
     next_d = sorted_dates[1] if len(sorted_dates) > 1 else target_d
+    # 截取未来最多 5 个到期日 (涵盖当周全部交易日及周五OPEX)
+    week_dates = sorted_dates[:5]
+    week_dates_set = set(week_dates)
 
-    near_opts = [item for item in filtered_opts if item[1] in (target_d, next_d)]
+    week_opts = [item for item in filtered_opts if item[1] in week_dates_set]
 
-    # 同步初始化/更新增量订单流账本 (FLOW_LEDGER)
-    update_flow_ledger(near_opts, spot)
+    # 更新全周期权增量订单流账本
+    update_flow_ledger(week_opts, spot)
+
+    first_lbl = f"{target_d[2:4]}-{target_d[4:6]}"
+    last_d = week_dates[-1]
+    last_lbl = f"{last_d[2:4]}-{last_d[4:6]}"
 
     RAW_CHAIN_CACHE[ticker_key] = {
         "cboe_spot": cboe_spot,
         "target_d": target_d,
         "next_d": next_d,
-        "exp_label": f"{target_d[2:4]}-{target_d[4:6]}",
-        "near_opts": near_opts,
+        "week_dates": week_dates,
+        "day_label": f"{first_lbl} 0DTE",
+        "week_label": f"{first_lbl}~{last_lbl} 周" if last_d != target_d else f"{first_lbl} 周",
+        "week_opts": week_opts,
     }
     return True
 
 
-# ==================== 4. 增量订单流账本 (根治全量Volume正负乱跳) ====================
+# ==================== 4. 增量订单流账本 ====================
 def calc_contract_flow_sign(opt_type, strike, spot, opt):
-    """计算单笔/当前状态盘口多空极性 ∈ [-1.0, +1.0]"""
     static_sign = 1.0 if opt_type == "C" else -1.0
     bid = float(opt.get("bid", 0) or 0)
     ask = float(opt.get("ask", 0) or 0)
     last_p = float(opt.get("last_trade_price", 0) or 0)
     prev_close = float(opt.get("prev_day_close", 0) or 0)
 
-    # 1. 盘口 Bid/Ask 报价位置因子
     quote_sign = static_sign
     if ask > bid and bid > 0 and last_p > 0:
         spread = max(ask - bid, 0.01)
-        # 限制在 [0.15, 0.85] 温和区间，防止单笔越界报价引发极端跳变
         ask_pos = max(0.0, min(1.0, (last_p - bid) / spread))
         quote_sign = 1.0 - 2.0 * ask_pos
 
-    # 2. 日内合约价格涨跌动量因子 (最稳健的资金流向锚：期权大涨=主动买盘Ask主导=-GEX；期权大跌=主动卖盘Bid主导=+GEX)
     mom_sign = static_sign
     if last_p > 0 and prev_close > 0:
         chg = (last_p - prev_close) / max(prev_close, 0.05)
         if chg > 0.12:
-            mom_sign = -0.85  # 客户主动扫货买入 -> 做市商 Short Gamma (-GEX)
+            mom_sign = -0.85
         elif chg < -0.12:
-            mom_sign = 0.85   # 客户主动砸盘卖出/平仓 -> 做市商 Long Gamma (+GEX 黄色护盘)
+            mom_sign = 0.85
 
-    # 60% 稳态涨跌动量 + 40% 盘口报价位置，彻底告别单笔tick反转
     return 0.60 * mom_sign + 0.40 * quote_sign
 
 
-def update_flow_ledger(near_opts, spot):
-    for sym, yymmdd, opt_type, strike, opt in near_opts:
+def update_flow_ledger(week_opts, spot):
+    for sym, yymmdd, opt_type, strike, opt in week_opts:
         vol = float(opt.get("volume", 0) or 0)
         cur_sign = calc_contract_flow_sign(opt_type, strike, spot, opt)
 
         rec = FLOW_LEDGER.get(sym)
         if rec is None:
-            # 首次建账：以稳态混合极性锁定初始已沉淀成交量
             FLOW_LEDGER[sym] = {
                 "vol": vol,
                 "signed_vol": vol * cur_sign,
@@ -252,15 +263,13 @@ def update_flow_ledger(near_opts, spot):
         else:
             delta_vol = vol - rec["vol"]
             if delta_vol > 0:
-                # 核心：只有新增的成交量(delta_vol)按最新盘口方向累加，历史已成交底仓绝不乱跳！
                 rec["signed_vol"] += delta_vol * cur_sign
                 rec["vol"] = vol
             else:
-                # 无新增成交时，仅做 3% 微幅阻尼修正，保持画面极度稳定
                 rec["signed_vol"] = 0.97 * rec["signed_vol"] + 0.03 * (vol * cur_sign)
 
 
-# ==================== 5. 内存级 GEX 计算引擎 ====================
+# ==================== 5. 内存级 GEX 计算引擎 (支持当日/全周双模秒切) ====================
 def compute_ticker_gex(ticker_key, use_ema=True):
     raw = RAW_CHAIN_CACHE.get(ticker_key)
     if not raw:
@@ -275,15 +284,27 @@ def compute_ticker_gex(ticker_key, use_ema=True):
         return None
 
     target_d = raw["target_d"]
+    next_d = raw["next_d"]
     est_now = get_us_eastern_now()
+    today_date = est_now.date()
     hours_left = max(1.0, (16 - est_now.hour) + (15 - est_now.minute) / 60.0) if est_now.hour < 16 else 4.0
     t_0dte = max(hours_left / (252.0 * 6.5), 1.0 / (252.0 * 24.0))
 
     strike_buckets = {}
     vol_weight = 1.35 if NOISE_REDUCTION else 0.75
 
-    for sym, yymmdd, opt_type, strike, opt in raw["near_opts"]:
-        date_factor = 1.0 if yymmdd == target_d else 0.35
+    for sym, yymmdd, opt_type, strike, opt in raw["week_opts"]:
+        # ==================== 当日 (0DTE) vs 全周 (WEEKLY) 过滤与权重 ====================
+        if not WEEKLY_MODE:
+            # 📅 当日模式：仅聚焦当日0DTE与次日近端缓冲
+            if yymmdd not in (target_d, next_d):
+                continue
+            date_factor = 1.0 if yymmdd == target_d else 0.25
+        else:
+            # 📆 全周模式：聚合当周全部 5 个到期日，按到期远近温和赋权
+            days_diff = yymmdd_to_days_diff(yymmdd, today_date)
+            date_factor = 1.0 if days_diff == 0 else max(0.55, 0.92 ** days_diff)
+
         grid_strike = round(round(strike / step) * step, 2)
 
         oi = float(opt.get("open_interest", 0) or 0)
@@ -293,10 +314,15 @@ def compute_ticker_gex(ticker_key, use_ema=True):
             iv = iv * 0.01
         raw_gamma = float(opt.get("gamma", 0) or 0)
 
-        t_exp = t_0dte if yymmdd == target_d else (t_0dte + 1.0 / 252.0)
+        if yymmdd == target_d:
+            t_exp = t_0dte
+        else:
+            days_diff = max(1, yymmdd_to_days_diff(yymmdd, today_date))
+            t_exp = t_0dte + (days_diff / 252.0)
+
         gamma = bs_live_gamma(spot, strike, max(iv, 0.05), t_exp) if raw_gamma <= 1e-6 else raw_gamma
 
-        # ✅ 已修复数值量级：使用标准单点美元Gamma (spot * 1e-6)，与 StrikeGEX 的 $M / $K 1:1 对齐
+        # 标准单点美元 Gamma ($M)
         unit_gex = gamma * spot * 0.000001 * date_factor
         static_sign = 1.0 if opt_type == "C" else -1.0
 
@@ -305,10 +331,11 @@ def compute_ticker_gex(ticker_key, use_ema=True):
             gex_m = unit_gex * eff_qty * static_sign
             flow_score = static_sign * vol
         else:
-            oi_keep = 0.40 if NOISE_REDUCTION else 0.65
+            # 全周模式下隔夜 OI 底仓权重更高(0.65)，当日模式下日内订单流权重更高(0.40)
+            base_oi_keep = 0.60 if WEEKLY_MODE else 0.40
+            oi_keep = base_oi_keep if NOISE_REDUCTION else (base_oi_keep + 0.20)
             oi_gex = unit_gex * (oi * oi_keep) * static_sign
 
-            # 从持久化增量账本读取稳定的净流向成交量
             ledger_rec = FLOW_LEDGER.get(sym)
             signed_vol = ledger_rec["signed_vol"] if ledger_rec else (vol * static_sign)
 
@@ -346,8 +373,8 @@ def compute_ticker_gex(ticker_key, use_ema=True):
         b = strike_buckets.get(s)
         raw_val = b["net_gex"] if b else 0.0
 
-        # EMA 阻尼平滑：75% 延续上一帧 + 25% 吸收新变化（手动切换按钮时跳过EMA立即响应）
-        ema_key = (ticker_key, s, LIVE_FLOW_MODE, NOISE_REDUCTION)
+        # 独立 EMA 键（包含 WEEKLY_MODE，确保日/周切换互不干扰）
+        ema_key = (ticker_key, s, WEEKLY_MODE, LIVE_FLOW_MODE, NOISE_REDUCTION)
         if use_ema and ema_key in EMA_GEX_CACHE:
             smoothed_val = 0.75 * EMA_GEX_CACHE[ema_key] + 0.25 * raw_val
         else:
@@ -403,18 +430,20 @@ def compute_ticker_gex(ticker_key, use_ema=True):
         r["intensity"] = round(min(1.0, abs(r["net_gex"]) / max_abs_gex), 3)
 
     alerts = []
-    prev_state = BASELINE_MEMORY.get(ticker_key)
+    base_key = (ticker_key, WEEKLY_MODE)
+    prev_state = BASELINE_MEMORY.get(base_key)
+    mode_tag = "全周" if WEEKLY_MODE else "日内"
     if prev_state:
         if call_wall > prev_state["call_wall"] and spot > prev_state["spot"]:
-            alerts.append(f"🚀 {ticker_key} 小火箭逼空：正Gamma阻力墙上移至 {call_wall}！")
+            alerts.append(f"🚀 {ticker_key} ({mode_tag}) 小火箭逼空：正Gamma阻力墙上移至 {call_wall}！")
         if spot < prev_state["put_wall"] and prev_state["spot"] >= prev_state["put_wall"]:
-            alerts.append(f"⚠️ {ticker_key} 破位警报：跌穿 {prev_state['put_wall']} 负Gamma触发位！")
+            alerts.append(f"⚠️ {ticker_key} ({mode_tag}) 破位警报：跌穿 {prev_state['put_wall']} 负Gamma触发位！")
 
-    BASELINE_MEMORY[ticker_key] = {"spot": spot, "call_wall": call_wall, "put_wall": put_wall}
+    BASELINE_MEMORY[base_key] = {"spot": spot, "call_wall": call_wall, "put_wall": put_wall}
 
     return {
         "ticker": ticker_key,
-        "exp": raw["exp_label"],
+        "exp": raw["week_label"] if WEEKLY_MODE else raw["day_label"],
         "spot": spot,
         "pct_change": pct_change,
         "zero_flip": zero_flip,
@@ -468,11 +497,20 @@ def api_gex():
     return jsonify({
         "timestamp": ts,
         "ready": len(data_copy) > 0,
+        "weekly_mode": WEEKLY_MODE,
         "live_flow_mode": LIVE_FLOW_MODE,
         "noise_reduction": NOISE_REDUCTION,
         "data": data_copy,
         "alerts": all_alerts,
     })
+
+
+@app.route("/api/toggle_weekly", methods=["POST"])
+def toggle_weekly():
+    global WEEKLY_MODE
+    WEEKLY_MODE = not WEEKLY_MODE
+    rebuild_render_cache(use_ema=False)
+    return jsonify({"status": "ok", "weekly_mode": WEEKLY_MODE})
 
 
 @app.route("/api/toggle_flow", methods=["POST"])
@@ -553,6 +591,18 @@ HTML_TEMPLATE = """
     cursor: pointer;
     transition: all 0.12s;
   }
+  .btn.active-day {
+    background: #10b981;
+    color: #052e16;
+    border-color: #34d399;
+    box-shadow: 0 0 10px rgba(16, 185, 129, 0.35);
+  }
+  .btn.active-week {
+    background: #8b5cf6;
+    color: #ffffff;
+    border-color: #a78bfa;
+    box-shadow: 0 0 10px rgba(139, 92, 246, 0.45);
+  }
   .btn.active-flow {
     background: #f59e0b;
     color: #0f172a;
@@ -590,13 +640,13 @@ HTML_TEMPLATE = """
     justify-content: space-between;
     align-items: baseline;
     font-weight: 800;
-    font-size: 15px;
+    font-size: 14px;
     margin-bottom: 6px;
   }
   .pct-tag {
     font-size: 11px;
     font-weight: 600;
-    margin-left: 5px;
+    margin-left: 4px;
   }
   .pills-row {
     display: flex;
@@ -672,7 +722,7 @@ HTML_TEMPLATE = """
     z-index: 9999;
     pointer-events: none;
     box-shadow: 0 8px 20px rgba(0,0,0,0.6);
-    min-width: 210px;
+    min-width: 220px;
   }
   .alert-banner {
     display: none;
@@ -697,6 +747,7 @@ HTML_TEMPLATE = """
     <span class="badge-live" id="clockTag">LIVE</span>
   </div>
   <div class="controls">
+    <button id="weekBtn" class="btn active-day" onclick="toggleMode('/api/toggle_weekly')">📅 周期: 当日 (0DTE)</button>
     <button id="flowBtn" class="btn active-flow" onclick="toggleMode('/api/toggle_flow')">⚡ LIVE FLOW: ON (盘口动态)</button>
     <button id="noiseBtn" class="btn active-sub" onclick="toggleMode('/api/toggle_noise')">🧹 降噪: ON</button>
     <button id="soundBtn" class="btn" onclick="toggleSound()">🔊 语音: OFF</button>
@@ -708,7 +759,7 @@ HTML_TEMPLATE = """
   <span style="cursor:pointer; padding:0 6px;" onclick="document.getElementById('alertBox').style.display='none'">✖</span>
 </div>
 <div id="grid" class="grid-container">
-  <div class="loading-box">⚡ 正在同步 CBOE 四标的期权链稳态快照 (约 1~2 秒)...</div>
+  <div class="loading-box">⚡ 正在同步 CBOE 四标的当日/全周期权链稳态快照 (约 1~2 秒)...</div>
 </div>
 <div id="tooltip"></div>
 
@@ -795,6 +846,10 @@ async function fetchGexData(force = false) {
     const json = await res.json();
 
     document.getElementById("clockTag").innerText = `LIVE ${json.timestamp}`;
+
+    const weekBtn = document.getElementById("weekBtn");
+    weekBtn.innerText = json.weekly_mode ? "📆 周期: 全周 (WEEKLY)" : "📅 周期: 当日 (0DTE)";
+    weekBtn.className = json.weekly_mode ? "btn active-week" : "btn active-day";
 
     const flowBtn = document.getElementById("flowBtn");
     flowBtn.innerText = json.live_flow_mode ? "⚡ LIVE FLOW: ON (盘口动态)" : "📊 STATIC OI (传统静态)";
@@ -905,7 +960,7 @@ if __name__ == "__main__":
     t = threading.Thread(target=background_sync_worker, daemon=True)
     t.start()
     print("=========================================================")
-    print("🚀 XSP/SPX GEX 稳态防闪烁版 (StrikeGEX Live Flow) 已启动")
+    print("🚀 XSP/SPX GEX 指挥中心 (含日/周双模秒切 + 稳态Live Flow) 已启动")
     print("👉 请在浏览器打开: http://127.0.0.1:5000")
     print("=========================================================")
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
