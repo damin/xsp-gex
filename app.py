@@ -6,12 +6,13 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta, date
 import requests
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
 # ==================== 全局核心开关 ====================
-WEEKLY_MODE = False       # False = 📅 当日(0DTE)模式 | True = 📆 全周(WEEKLY 5到期日聚合)模式
+SELECTED_EXP = "AUTO"     # "AUTO" = 美东16:15收盘后自动跳下一交易日 | 或指定如 "261117", "261118"
+WEEKLY_MODE = False       # False = 📅 单日模式 | True = 📆 全周(5到期日聚合)模式
 LIVE_FLOW_MODE = True     # True = StrikeGEX动态盘口流向(增量账本稳态版) | False = 传统静态(Call正/Put负)
 NOISE_REDUCTION = True    # True = 过滤远端噪音，聚焦ATM核心博弈区
 
@@ -28,14 +29,16 @@ HEADERS = {
     "Cache-Control": "no-cache",
 }
 
-# ==================== 内存持久化状态池 (防闪烁/防回退/秒切周日模式) ====================
-RAW_CHAIN_CACHE = {}      # 缓存经过防倒退校验的CBOE期权链 (含未来5个到期日全周数据)
+# ==================== 内存持久化状态池 ====================
+RAW_CHAIN_CACHE = {}      # 缓存经过防倒退校验的CBOE期权链 (含未来7个到期日)
 CHAIN_VOL_STAMP = {}      # 记录每个标的最大累计成交量，拦截落后的CDN旧节点
 FLOW_LEDGER = {}          # 增量订单流账本: {opt_sym: {"vol": float, "signed_vol": float}}
 EMA_GEX_CACHE = {}        # 行权价级别EMA平滑缓存
 SPOT_CACHE = {}           # 持久化最新实时现价(永不回退15分钟延迟价)
 RENDER_CACHE = {}         # 前端秒读缓存
 BASELINE_MEMORY = {}      # 破位与小火箭预警记忆
+AVAIL_DATES_LIST = []     # 前端下拉框可选日期列表
+ACTIVE_AUTO_DATE = ""     # 当前 AUTO 模式实际锁定的日期 (YYMMDD)
 LAST_UPDATE_STR = "同步中..."
 CACHE_LOCK = threading.Lock()
 
@@ -63,7 +66,15 @@ def kill_stale_port_5000():
 
 
 def get_us_eastern_now():
+    """获取美东标准时间 (EST)"""
     return datetime.now(timezone.utc) - timedelta(hours=5)
+
+
+def is_after_market_close(est_now=None):
+    """判断美东时间是否已过 16:15 期权收盘节点"""
+    if est_now is None:
+        est_now = get_us_eastern_now()
+    return (est_now.hour > 16) or (est_now.hour == 16 and est_now.minute >= 15)
 
 
 def yymmdd_to_days_diff(yymmdd_str, today_date):
@@ -74,6 +85,13 @@ def yymmdd_to_days_diff(yymmdd_str, today_date):
         return max(0, (date(y, m, d) - today_date).days)
     except Exception:
         return 1
+
+
+def format_yymmdd_label(yymmdd_str, today_yymmdd, after_close):
+    mm_dd = f"{yymmdd_str[2:4]}-{yymmdd_str[4:6]}"
+    if yymmdd_str == today_yymmdd:
+        return f"{mm_dd} (今日收盘)" if after_close else f"{mm_dd} (今日0DTE)"
+    return f"20{yymmdd_str[0:2]}-{mm_dd}"
 
 
 # ==================== 1. 实时现价抓取 (带持久化防回退锁) ====================
@@ -120,7 +138,7 @@ def bs_live_gamma(spot, strike, iv, t_years):
         return 0.0
 
 
-# ==================== 3. CBOE 期权链拉取 (预缓存未来5个到期日以支持周/日秒切) ====================
+# ==================== 3. CBOE 期权链拉取 (预缓存未来7个到期日供自由切换) ====================
 def fetch_cboe_raw_chain(ticker_key):
     cfg = TICKERS[ticker_key]
     cboe_sym = cfg["cboe"]
@@ -196,29 +214,16 @@ def fetch_cboe_raw_chain(ticker_key):
         return True
     CHAIN_VOL_STAMP[ticker_key] = max(prev_max_vol, total_chain_vol)
 
-    sorted_dates = sorted(list(avail_dates))
-    target_d = sorted_dates[0]
-    next_d = sorted_dates[1] if len(sorted_dates) > 1 else target_d
-    # 截取未来最多 5 个到期日 (涵盖当周全部交易日及周五OPEX)
-    week_dates = sorted_dates[:5]
-    week_dates_set = set(week_dates)
+    # 保留最近 7 个到期日（含今日收盘与未来一周多）
+    sorted_dates = sorted(list(avail_dates))[:7]
+    kept_set = set(sorted_dates)
+    week_opts = [item for item in filtered_opts if item[1] in kept_set]
 
-    week_opts = [item for item in filtered_opts if item[1] in week_dates_set]
-
-    # 更新全周期权增量订单流账本
     update_flow_ledger(week_opts, spot)
-
-    first_lbl = f"{target_d[2:4]}-{target_d[4:6]}"
-    last_d = week_dates[-1]
-    last_lbl = f"{last_d[2:4]}-{last_d[4:6]}"
 
     RAW_CHAIN_CACHE[ticker_key] = {
         "cboe_spot": cboe_spot,
-        "target_d": target_d,
-        "next_d": next_d,
-        "week_dates": week_dates,
-        "day_label": f"{first_lbl} 0DTE",
-        "week_label": f"{first_lbl}~{last_lbl} 周" if last_d != target_d else f"{first_lbl} 周",
+        "avail_dates": sorted_dates,
         "week_opts": week_opts,
     }
     return True
@@ -269,7 +274,47 @@ def update_flow_ledger(week_opts, spot):
                 rec["signed_vol"] = 0.97 * rec["signed_vol"] + 0.03 * (vol * cur_sign)
 
 
-# ==================== 5. 内存级 GEX 计算引擎 (支持当日/全周双模秒切) ====================
+# ==================== 5. 智能日期解析器 (16:15自动跨日 + 手动选日) ====================
+def resolve_active_dates(avail_dates, est_now):
+    """返回: (target_d, active_week_dates, exp_badge_label)"""
+    today_yymmdd = est_now.strftime("%y%m%d")
+    after_close = is_after_market_close(est_now)
+
+    # 1. 如果用户在下拉框手动指定了某个具体日期
+    if SELECTED_EXP != "AUTO" and SELECTED_EXP in avail_dates:
+        target_d = SELECTED_EXP
+        idx = avail_dates.index(target_d)
+        week_slice = avail_dates[idx:idx + 5]
+    else:
+        # 2. AUTO 自动模式：美东 16:15 后自动跳过今日已收盘期权，锁定明天(下一交易日)！
+        if after_close:
+            future_dates = [d for d in avail_dates if d > today_yymmdd]
+            if future_dates:
+                target_d = future_dates[0]
+                week_slice = future_dates[:5]
+            else:
+                target_d = avail_dates[0]
+                week_slice = avail_dates[:5]
+        else:
+            target_d = avail_dates[0]
+            week_slice = avail_dates[:5]
+
+    first_lbl = f"{target_d[2:4]}-{target_d[4:6]}"
+    last_d = week_slice[-1] if week_slice else target_d
+    last_lbl = f"{last_d[2:4]}-{last_d[4:6]}"
+
+    if WEEKLY_MODE:
+        exp_label = f"{first_lbl}~{last_lbl} 周" if last_d != target_d else f"{first_lbl} 周"
+    else:
+        if target_d == today_yymmdd:
+            exp_label = f"{first_lbl} 收盘" if after_close else f"{first_lbl} 0DTE"
+        else:
+            exp_label = f"{first_lbl}"
+
+    return target_d, week_slice, exp_label
+
+
+# ==================== 6. 内存级 GEX 计算引擎 ====================
 def compute_ticker_gex(ticker_key, use_ema=True):
     raw = RAW_CHAIN_CACHE.get(ticker_key)
     if not raw:
@@ -283,27 +328,30 @@ def compute_ticker_gex(ticker_key, use_ema=True):
     if spot <= 0:
         return None
 
-    target_d = raw["target_d"]
-    next_d = raw["next_d"]
     est_now = get_us_eastern_now()
     today_date = est_now.date()
-    hours_left = max(1.0, (16 - est_now.hour) + (15 - est_now.minute) / 60.0) if est_now.hour < 16 else 4.0
+    avail_dates = raw["avail_dates"]
+    target_d, week_slice, exp_label = resolve_active_dates(avail_dates, est_now)
+    week_slice_set = set(week_slice)
+
+    hours_left = max(1.0, (16 - est_now.hour) + (15 - est_now.minute) / 60.0) if est_now.hour < 16 else 1.5
     t_0dte = max(hours_left / (252.0 * 6.5), 1.0 / (252.0 * 24.0))
 
     strike_buckets = {}
     vol_weight = 1.35 if NOISE_REDUCTION else 0.75
 
     for sym, yymmdd, opt_type, strike, opt in raw["week_opts"]:
-        # ==================== 当日 (0DTE) vs 全周 (WEEKLY) 过滤与权重 ====================
         if not WEEKLY_MODE:
-            # 📅 当日模式：仅聚焦当日0DTE与次日近端缓冲
-            if yymmdd not in (target_d, next_d):
+            # 📅 单日模式：精准锁定当前选定/自动跨日后的目标日期 (target_d)
+            if yymmdd != target_d:
                 continue
-            date_factor = 1.0 if yymmdd == target_d else 0.25
+            date_factor = 1.0
         else:
-            # 📆 全周模式：聚合当周全部 5 个到期日，按到期远近温和赋权
+            # 📆 全周模式：聚合从 target_d 开始的 5 个交易日
+            if yymmdd not in week_slice_set:
+                continue
             days_diff = yymmdd_to_days_diff(yymmdd, today_date)
-            date_factor = 1.0 if days_diff == 0 else max(0.55, 0.92 ** days_diff)
+            date_factor = 1.0 if yymmdd == target_d else max(0.55, 0.92 ** days_diff)
 
         grid_strike = round(round(strike / step) * step, 2)
 
@@ -314,15 +362,14 @@ def compute_ticker_gex(ticker_key, use_ema=True):
             iv = iv * 0.01
         raw_gamma = float(opt.get("gamma", 0) or 0)
 
-        if yymmdd == target_d:
+        days_diff = yymmdd_to_days_diff(yymmdd, today_date)
+        if days_diff == 0:
             t_exp = t_0dte
         else:
-            days_diff = max(1, yymmdd_to_days_diff(yymmdd, today_date))
-            t_exp = t_0dte + (days_diff / 252.0)
+            t_exp = (days_diff * 6.5 + hours_left) / (252.0 * 6.5)
 
         gamma = bs_live_gamma(spot, strike, max(iv, 0.05), t_exp) if raw_gamma <= 1e-6 else raw_gamma
 
-        # 标准单点美元 Gamma ($M)
         unit_gex = gamma * spot * 0.000001 * date_factor
         static_sign = 1.0 if opt_type == "C" else -1.0
 
@@ -331,8 +378,7 @@ def compute_ticker_gex(ticker_key, use_ema=True):
             gex_m = unit_gex * eff_qty * static_sign
             flow_score = static_sign * vol
         else:
-            # 全周模式下隔夜 OI 底仓权重更高(0.65)，当日模式下日内订单流权重更高(0.40)
-            base_oi_keep = 0.60 if WEEKLY_MODE else 0.40
+            base_oi_keep = 0.60 if WEEKLY_MODE else 0.42
             oi_keep = base_oi_keep if NOISE_REDUCTION else (base_oi_keep + 0.20)
             oi_gex = unit_gex * (oi * oi_keep) * static_sign
 
@@ -373,8 +419,7 @@ def compute_ticker_gex(ticker_key, use_ema=True):
         b = strike_buckets.get(s)
         raw_val = b["net_gex"] if b else 0.0
 
-        # 独立 EMA 键（包含 WEEKLY_MODE，确保日/周切换互不干扰）
-        ema_key = (ticker_key, s, WEEKLY_MODE, LIVE_FLOW_MODE, NOISE_REDUCTION)
+        ema_key = (ticker_key, s, target_d, WEEKLY_MODE, LIVE_FLOW_MODE, NOISE_REDUCTION)
         if use_ema and ema_key in EMA_GEX_CACHE:
             smoothed_val = 0.75 * EMA_GEX_CACHE[ema_key] + 0.25 * raw_val
         else:
@@ -430,20 +475,20 @@ def compute_ticker_gex(ticker_key, use_ema=True):
         r["intensity"] = round(min(1.0, abs(r["net_gex"]) / max_abs_gex), 3)
 
     alerts = []
-    base_key = (ticker_key, WEEKLY_MODE)
+    base_key = (ticker_key, target_d, WEEKLY_MODE)
     prev_state = BASELINE_MEMORY.get(base_key)
-    mode_tag = "全周" if WEEKLY_MODE else "日内"
     if prev_state:
         if call_wall > prev_state["call_wall"] and spot > prev_state["spot"]:
-            alerts.append(f"🚀 {ticker_key} ({mode_tag}) 小火箭逼空：正Gamma阻力墙上移至 {call_wall}！")
+            alerts.append(f"🚀 {ticker_key} ({exp_label}) 小火箭逼空：正Gamma阻力墙上移至 {call_wall}！")
         if spot < prev_state["put_wall"] and prev_state["spot"] >= prev_state["put_wall"]:
-            alerts.append(f"⚠️ {ticker_key} ({mode_tag}) 破位警报：跌穿 {prev_state['put_wall']} 负Gamma触发位！")
+            alerts.append(f"⚠️ {ticker_key} ({exp_label}) 破位警报：跌穿 {prev_state['put_wall']} 负Gamma触发位！")
 
     BASELINE_MEMORY[base_key] = {"spot": spot, "call_wall": call_wall, "put_wall": put_wall}
 
     return {
         "ticker": ticker_key,
-        "exp": raw["week_label"] if WEEKLY_MODE else raw["day_label"],
+        "exp": exp_label,
+        "target_d": target_d,
         "spot": spot,
         "pct_change": pct_change,
         "zero_flip": zero_flip,
@@ -458,17 +503,33 @@ def compute_ticker_gex(ticker_key, use_ema=True):
 
 
 def rebuild_render_cache(use_ema=True):
-    global LAST_UPDATE_STR
+    global LAST_UPDATE_STR, AVAIL_DATES_LIST, ACTIVE_AUTO_DATE
     new_render = {}
+    est_now = get_us_eastern_now()
+    today_yymmdd = est_now.strftime("%y%m%d")
+    after_close = is_after_market_close(est_now)
+
+    # 汇总可选日期列表供前端下拉框使用
+    sample_raw = RAW_CHAIN_CACHE.get("SPY") or RAW_CHAIN_CACHE.get("SPX") or next(iter(RAW_CHAIN_CACHE.values()), None)
+    if sample_raw:
+        avail = sample_raw["avail_dates"]
+        auto_d, _, _ = resolve_active_dates(avail, est_now)
+        ACTIVE_AUTO_DATE = f"{auto_d[2:4]}-{auto_d[4:6]}"
+        AVAIL_DATES_LIST = [
+            {"val": d, "label": format_yymmdd_label(d, today_yymmdd, after_close)}
+            for d in avail
+        ]
+
     for k in ["SPX", "XSP", "SPY", "QQQ"]:
         res = compute_ticker_gex(k, use_ema=use_ema)
         if res:
             new_render[k] = res
         elif k in RENDER_CACHE:
             new_render[k] = RENDER_CACHE[k]
+
     with CACHE_LOCK:
         RENDER_CACHE.update(new_render)
-        LAST_UPDATE_STR = datetime.now().strftime("%H:%M:%S")
+        LAST_UPDATE_STR = est_now.strftime("%H:%M:%S EST")
 
 
 def background_sync_worker():
@@ -483,12 +544,14 @@ def background_sync_worker():
         time.sleep(5.0)
 
 
-# ==================== 6. Flask 极速路由 ====================
+# ==================== 7. Flask 极速路由 ====================
 @app.route("/api/gex")
 def api_gex():
     with CACHE_LOCK:
         data_copy = dict(RENDER_CACHE)
         ts = LAST_UPDATE_STR
+        avail_copy = list(AVAIL_DATES_LIST)
+        auto_d = ACTIVE_AUTO_DATE
 
     all_alerts = []
     for k, v in data_copy.items():
@@ -497,12 +560,28 @@ def api_gex():
     return jsonify({
         "timestamp": ts,
         "ready": len(data_copy) > 0,
+        "selected_exp": SELECTED_EXP,
+        "active_auto_date": auto_d,
+        "avail_dates": avail_copy,
         "weekly_mode": WEEKLY_MODE,
         "live_flow_mode": LIVE_FLOW_MODE,
         "noise_reduction": NOISE_REDUCTION,
         "data": data_copy,
         "alerts": all_alerts,
     })
+
+
+@app.route("/api/set_date", methods=["POST"])
+def set_date():
+    global SELECTED_EXP, WEEKLY_MODE
+    req = request.get_json(silent=True) or {}
+    exp_val = req.get("exp", "AUTO")
+    SELECTED_EXP = exp_val
+    if exp_val != "AUTO":
+        # 手动选择具体某一天时，自动切回单日视图以便直接查看该日GEX
+        WEEKLY_MODE = False
+    rebuild_render_cache(use_ema=False)
+    return jsonify({"status": "ok", "selected_exp": SELECTED_EXP, "weekly_mode": WEEKLY_MODE})
 
 
 @app.route("/api/toggle_weekly", methods=["POST"])
@@ -529,7 +608,7 @@ def toggle_noise():
     return jsonify({"status": "ok", "noise_reduction": NOISE_REDUCTION})
 
 
-# ==================== 7. 前端可视化界面 ====================
+# ==================== 8. 前端可视化界面 ====================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -579,6 +658,17 @@ HTML_TEMPLATE = """
     flex-wrap: wrap;
     align-items: center;
     gap: 8px;
+  }
+  .date-select {
+    background: #0f172a;
+    color: #38bdf8;
+    border: 1px solid #0284c7;
+    padding: 5px 10px;
+    border-radius: 5px;
+    font-size: 12px;
+    font-weight: 800;
+    cursor: pointer;
+    outline: none;
   }
   .btn {
     border: 1px solid #334155;
@@ -747,7 +837,10 @@ HTML_TEMPLATE = """
     <span class="badge-live" id="clockTag">LIVE</span>
   </div>
   <div class="controls">
-    <button id="weekBtn" class="btn active-day" onclick="toggleMode('/api/toggle_weekly')">📅 周期: 当日 (0DTE)</button>
+    <select id="dateSelect" class="date-select" onchange="changeExpDate(this.value)">
+      <option value="AUTO">🤖 自动换日 (16:15跳次日)</option>
+    </select>
+    <button id="weekBtn" class="btn active-day" onclick="toggleMode('/api/toggle_weekly')">📅 周期: 单日 (DAY)</button>
     <button id="flowBtn" class="btn active-flow" onclick="toggleMode('/api/toggle_flow')">⚡ LIVE FLOW: ON (盘口动态)</button>
     <button id="noiseBtn" class="btn active-sub" onclick="toggleMode('/api/toggle_noise')">🧹 降噪: ON</button>
     <button id="soundBtn" class="btn" onclick="toggleSound()">🔊 语音: OFF</button>
@@ -759,7 +852,7 @@ HTML_TEMPLATE = """
   <span style="cursor:pointer; padding:0 6px;" onclick="document.getElementById('alertBox').style.display='none'">✖</span>
 </div>
 <div id="grid" class="grid-container">
-  <div class="loading-box">⚡ 正在同步 CBOE 四标的当日/全周期权链稳态快照 (约 1~2 秒)...</div>
+  <div class="loading-box">⚡ 正在同步 CBOE 四标的期权链稳态快照 (约 1~2 秒)...</div>
 </div>
 <div id="tooltip"></div>
 
@@ -792,6 +885,15 @@ function getRowStyle(gex, intensity) {
     }
     return `background: rgba(59, 7, 100, 0.35); color: #94a3b8;`;
   }
+}
+
+async function changeExpDate(expVal) {
+  await fetch("/api/set_date", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ exp: expVal })
+  });
+  fetchGexData(true);
 }
 
 async function toggleMode(endpoint) {
@@ -847,8 +949,23 @@ async function fetchGexData(force = false) {
 
     document.getElementById("clockTag").innerText = `LIVE ${json.timestamp}`;
 
+    // 动态同步顶部日期选择下拉框
+    const sel = document.getElementById("dateSelect");
+    if (json.avail_dates && json.avail_dates.length > 0) {
+      const autoText = json.active_auto_date ? `🤖 自动换日 (当前: ${json.active_auto_date})` : "🤖 自动换日 (16:15跳次日)";
+      let optsHtml = `<option value="AUTO">${autoText}</option>`;
+      for (const item of json.avail_dates) {
+        const selectedAttr = (json.selected_exp === item.val) ? "selected" : "";
+        optsHtml += `<option value="${item.val}" ${selectedAttr}>📅 ${item.label}</option>`;
+      }
+      if (sel.innerHTML !== optsHtml) {
+        sel.innerHTML = optsHtml;
+        sel.value = json.selected_exp || "AUTO";
+      }
+    }
+
     const weekBtn = document.getElementById("weekBtn");
-    weekBtn.innerText = json.weekly_mode ? "📆 周期: 全周 (WEEKLY)" : "📅 周期: 当日 (0DTE)";
+    weekBtn.innerText = json.weekly_mode ? "📆 周期: 全周 (WEEKLY)" : "📅 周期: 单日 (DAY)";
     weekBtn.className = json.weekly_mode ? "btn active-week" : "btn active-day";
 
     const flowBtn = document.getElementById("flowBtn");
@@ -960,7 +1077,7 @@ if __name__ == "__main__":
     t = threading.Thread(target=background_sync_worker, daemon=True)
     t.start()
     print("=========================================================")
-    print("🚀 XSP/SPX GEX 指挥中心 (含日/周双模秒切 + 稳态Live Flow) 已启动")
+    print("🚀 XSP/SPX GEX 指挥中心 (16:15自动跨日 + 任意日期选择器) 已启动")
     print("👉 请在浏览器打开: http://127.0.0.1:5000")
     print("=========================================================")
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
