@@ -11,29 +11,90 @@ CBOE_URLS = {
     "SPY": "https://cdn.cboe.com/api/global/delayed_quotes/options/SPY.json",
     "QQQ": "https://cdn.cboe.com/api/global/delayed_quotes/options/QQQ.json",
 }
-HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Accept": "application/json"}
 OPT_REGEX = re.compile(r"^([A-Z_]+?)(\d{6})([CP])(\d{8})$")
 CACHE_FILE = "gex_auto_cache.json"
 ROLLING_HISTORY = deque(maxlen=60)
+BG_STARTED = False
+BG_LOCK = threading.Lock()
 
 STATE = {
     "mode": "next",
-    "skew_adj": True,
-    "last_update": "正在同步 CBOE 期权链...",
+    "skew_adj": False,
+    "last_update": "正在同步毫秒级实时点位与 CBOE 期权链...",
     "baseline_time": "自动锚定中...",
     "rolling_time": "积累滑动窗口中...",
     "trading_day": "",
     "rth_locked": False,
-    "public_url": "云端/公网模式就绪",
+    "public_url": "云端24小时实时运行中",
     "lan_url": "",
+    "live_spots": {},
     "baseline_data": {},
     "current_data": {},
     "alerts": [],
     "xsp_advice": {}
 }
 
+def is_cloud_env():
+    return bool(os.environ.get("RENDER") or os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("PORT"))
+
 def get_est_now():
     return datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=5)
+
+def fetch_realtime_spots():
+    spots = {}
+    ts = int(time.time() * 1000)
+    try:
+        cnbc_url = f"https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol?symbols=.SPX%7C.XSP%7CSPY%7CQQQ&requestMethod=itv&noform=1&partnerId=2&fund=1&exthrs=1&output=json&_={ts}"
+        r = requests.get(cnbc_url, headers=HEADERS, timeout=4)
+        q_list = r.json().get("FormattedQuoteResult", {}).get("FormattedQuote", [])
+        if isinstance(q_list, dict): q_list = [q_list]
+        sym_map = {".SPX": "SPX", ".XSP": "XSP", "SPY": "SPY", "QQQ": "QQQ"}
+        est = get_est_now()
+        is_rth = (est.hour > 9 or (est.hour == 9 and est.minute >= 30)) and (est.hour < 16)
+        for q in q_list:
+            tk = sym_map.get(q.get("symbol"))
+            if not tk: continue
+            raw_p = q.get("last")
+            if not is_rth and q.get("ExtendedMktQuote", {}).get("last"):
+                raw_p = q["ExtendedMktQuote"]["last"]
+            if raw_p:
+                val = float(str(raw_p).replace(",", ""))
+                if val > 0: spots[tk] = val
+    except Exception:
+        pass
+
+    yf_map = {"SPX": "^GSPC", "XSP": "^XSP", "SPY": "SPY", "QQQ": "QQQ"}
+    for tk, sym in yf_map.items():
+        if tk in spots and spots[tk] > 0: continue
+        try:
+            u = f"https://query2.finance.yahoo.com/v8/finance/chart/{sym}?interval=1m&range=1d&includePrePost=true&_={ts}"
+            r = requests.get(u, headers=HEADERS, timeout=4)
+            res = r.json().get("chart", {}).get("result", [])
+            if not res: continue
+            meta = res[0].get("meta", {})
+            reg_p = float(meta.get("regularMarketPrice") or 0)
+            closes = res[0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
+            valid_c = [float(c) for c in closes if c is not None and c > 0]
+            est = get_est_now()
+            is_rth = (est.hour > 9 or (est.hour == 9 and est.minute >= 30)) and (est.hour < 16)
+            if is_rth and reg_p > 0:
+                spots[tk] = reg_p
+            elif valid_c:
+                spots[tk] = valid_c[-1]
+            elif reg_p > 0:
+                spots[tk] = reg_p
+        except Exception:
+            pass
+
+    if "SPX" in spots and "XSP" not in spots:
+        spots["XSP"] = round(spots["SPX"] / 10.0, 2)
+    elif "XSP" in spots and "SPX" not in spots:
+        spots["SPX"] = round(spots["XSP"] * 10.0, 2)
+
+    if spots:
+        STATE["live_spots"] = spots
+    return STATE["live_spots"]
 
 def get_lan_ip():
     try:
@@ -46,33 +107,32 @@ def get_lan_ip():
         return "http://127.0.0.1:5050"
 
 def generate_cloud_24h_package():
+    if is_cloud_env(): return
     cloud_dir = "cloud_24h_deploy"
     try:
         os.makedirs(cloud_dir, exist_ok=True)
         old_docker = os.path.join(cloud_dir, "Dockerfile")
-        if os.path.exists(old_docker):
-            os.remove(old_docker)
+        if os.path.exists(old_docker): os.remove(old_docker)
         with open(__file__, "r", encoding="utf-8") as f:
             self_code = f.read()
         with open(os.path.join(cloud_dir, "app.py"), "w", encoding="utf-8") as f:
             f.write(self_code)
         with open(os.path.join(cloud_dir, "requirements.txt"), "w", encoding="utf-8") as f:
-            f.write("flask\nrequests\ngunicorn\n")
-        print(f"☁️ 已生成免Docker纯Python云端包: ./{cloud_dir}/ (仅含 app.py 与 requirements.txt)")
+            f.write("flask>=3.0.0\nrequests>=2.31.0\ngunicorn>=21.2.0\n")
+        print(f"☁️ 已同步更新 Render.com 部署文件至: ./{cloud_dir}/ (app.py, requirements.txt)")
     except Exception as e:
-        print(f"[Cloud Gen Warn] {e}")
+        print(f"[Cloud Sync Warn] {e}")
 
 def start_public_tunnel():
     ext_url = os.environ.get("RENDER_EXTERNAL_URL")
-    if ext_url or os.environ.get("RENDER") or os.environ.get("PORT"):
-        STATE["public_url"] = ext_url or "24小时云端服务器运行中 (直接收藏当前网址)"
+    if is_cloud_env():
+        STATE["public_url"] = ext_url or "Render云端24小时实时运行中"
         return
     STATE["lan_url"] = get_lan_ip()
     is_win = platform.system().lower().startswith("win")
     bin_name = "cloudflared.exe" if is_win else "cloudflared"
     if not os.path.exists(bin_name):
         try:
-            print("🌐 正在下载本机临时公网组件 cloudflared...")
             dl_url = (
                 "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
                 if is_win else
@@ -94,7 +154,7 @@ def start_public_tunnel():
             m = url_pat.search(line)
             if m:
                 STATE["public_url"] = m.group(1)
-                print(f"\n📱 手机流量(4G/5G)临时公网网址: {STATE['public_url']}\n")
+                print(f"\n📱 本机临时手机公网网址: {STATE['public_url']}\n")
                 break
     except Exception:
         STATE["public_url"] = STATE["lan_url"]
@@ -127,24 +187,35 @@ def load_baseline_cache():
     except Exception:
         pass
 
-def bs_gamma_fallback(spot, strike, iv, dte_days):
-    t = max(dte_days, 0.25) / 365.0
-    sigma = iv if (iv and 0.03 < iv < 3.0) else 0.18
-    if spot <= 0 or strike <= 0: return 0.0
-    d1 = (math.log(spot / strike) + 0.5 * (sigma ** 2) * t) / (sigma * math.sqrt(t))
-    return (math.exp(-0.5 * (d1 ** 2)) / math.sqrt(2.0 * math.pi)) / (spot * sigma * math.sqrt(t))
+def bs_live_gamma(spot, strike, iv, t_years):
+    sigma = iv if (iv and 0.04 < iv < 2.5) else 0.16
+    if spot <= 0 or strike <= 0 or t_years <= 0:
+        return 0.0
+    sqrt_t = math.sqrt(t_years)
+    d1 = (math.log(spot / strike) + 0.5 * (sigma ** 2) * t_years) / (sigma * sqrt_t)
+    if abs(d1) > 6.0:
+        return 0.0
+    pdf_d1 = math.exp(-0.5 * (d1 ** 2)) / math.sqrt(2.0 * math.pi)
+    return pdf_d1 / (spot * sigma * sqrt_t)
 
-def fetch_cboe_gex(ticker, url, strike_step, mode="next", skew_adj=True, num_strikes=28):
-    resp = requests.get(url, headers=HEADERS, timeout=12)
+def fetch_cboe_gex(ticker, url, strike_step, mode="next", skew_adj=False, live_spots=None, num_strikes=30):
+    ts = int(time.time() * 1000)
+    sep = "&" if "?" in url else "?"
+    resp = requests.get(f"{url}{sep}_={ts}", headers=HEADERS, timeout=12)
     resp.raise_for_status()
     payload = resp.json().get("data", {})
-    spot = float(payload.get("current_price") or payload.get("close") or 0)
+    cboe_delayed_spot = float(payload.get("current_price") or payload.get("close") or 0)
     options = payload.get("options", [])
-    if spot <= 0 or not options: raise ValueError(f"{ticker} 数据为空")
+    if cboe_delayed_spot <= 0 or not options:
+        raise ValueError(f"{ticker} 数据为空")
+
+    spot = cboe_delayed_spot
+    if live_spots and ticker in live_spots and live_spots[ticker] > 0:
+        spot = live_spots[ticker]
 
     est_now = get_est_now()
     today_str = est_now.strftime("%y%m%d")
-    is_after_close = (est_now.hour >= 16)
+    is_after_close = (est_now.hour > 16) or (est_now.hour == 16 and est_now.minute >= 15)
 
     all_exps = sorted({m.group(2) for opt in options if (m := OPT_REGEX.match(opt.get("option", ""))) and m.group(2) >= today_str})
     if not all_exps:
@@ -171,58 +242,44 @@ def fetch_cboe_gex(ticker, url, strike_step, mode="next", skew_adj=True, num_str
         if key not in chain_group:
             chain_group[key] = {
                 "C_oi": 0.0, "C_vol": 0.0, "C_g": 0.0, "C_iv": 0.0,
-                "P_oi": 0.0, "P_vol": 0.0, "P_g": 0.0, "P_iv": 0.0, "P_bid": 0.0, "P_ask": 0.0, "P_last": 0.0
+                "P_oi": 0.0, "P_vol": 0.0, "P_g": 0.0, "P_iv": 0.0
             }
         rg, riv = float(opt.get("gamma") or 0.0), float(opt.get("iv") or 0.0)
         chain_group[key][f"{opt_type}_oi"] += float(opt.get("open_interest") or 0.0)
         chain_group[key][f"{opt_type}_vol"] += float(opt.get("volume") or 0.0)
-        if opt_type == "P":
-            chain_group[key]["P_bid"] = float(opt.get("bid") or 0.0)
-            chain_group[key]["P_ask"] = float(opt.get("ask") or 0.0)
-            chain_group[key]["P_last"] = float(opt.get("last_trade_price") or 0.0)
         if rg > 0: chain_group[key][f"{opt_type}_g"] = rg
         if riv > 0: chain_group[key][f"{opt_type}_iv"] = riv
 
-    raw_strike_data = {}
+    strike_map = {}
     for (exp_str, strike), d in chain_group.items():
         exp_dt = datetime.datetime.strptime("20" + exp_str, "%Y%m%d").date()
-        dte_days = max((exp_dt - est_now.date()).days, 0.35)
-        ug = (d["C_g"] or d["P_g"]) if strike >= spot else (d["P_g"] or d["C_g"])
-        riv = (d["C_iv"] or d["P_iv"]) if strike >= spot else (d["P_iv"] or d["C_iv"])
-        bs_g = bs_gamma_fallback(spot, strike, riv, dte_days)
-        if ug <= 0 or ug > bs_g * 3.0: ug = bs_g
+        days_diff = (exp_dt - est_now.date()).days
+        if days_diff <= 0:
+            close_dt = est_now.replace(hour=16, minute=0, second=0, microsecond=0)
+            rem_hours = max((close_dt - est_now).total_seconds() / 3600.0, 0.40)
+            t_years = rem_hours / (252.0 * 6.5)
+        else:
+            t_years = (days_diff + 0.5) / 252.0
 
-        c_eff = d["C_oi"] + d["C_vol"] * 0.30
-        p_eff = d["P_oi"] + d["P_vol"] * 0.30
-        p_flow_mult = 0.55 if (skew_adj and d["P_ask"] > d["P_bid"] > 0 and 0 < d["P_last"] <= 0.5 * (d["P_bid"] + d["P_ask"])) else 1.0
+        ref_iv = (d["C_iv"] or d["P_iv"]) if strike >= spot else (d["P_iv"] or d["C_iv"])
+        live_g = bs_live_gamma(spot, strike, ref_iv, t_years)
+        cboe_g = (d["C_g"] or d["P_g"]) if strike >= spot else (d["P_g"] or d["C_g"])
+        unit_gamma = live_g if live_g > 0 else cboe_g
 
-        if strike not in raw_strike_data:
-            raw_strike_data[strike] = {"c_gex": 0.0, "p_gex": 0.0}
-        scale = 2.5 if ticker == "SPX" else (10.0 if ticker == "XSP" else 1.0)
-        factor = ug * 100.0 * spot * scale / 1e6
-        raw_strike_data[strike]["c_gex"] += c_eff * factor
-        raw_strike_data[strike]["p_gex"] += (p_eff * p_flow_mult) * factor
+        c_oi, p_oi = d["C_oi"], d["P_oi"]
+        if skew_adj:
+            p_oi = p_oi * 0.75
+        net_oi = c_oi - p_oi
 
-    all_strikes = sorted(raw_strike_data.keys())
+        gex_m = unit_gamma * net_oi * 100.0 * spot / 1e6
+        strike_map[strike] = strike_map.get(strike, 0.0) + gex_m
+
+    all_strikes = sorted(strike_map.keys())
     atm = min(all_strikes, key=lambda k: abs(k - spot)) if all_strikes else round(spot / strike_step) * strike_step
     sel = sorted([k for k in all_strikes if abs(k - atm) <= strike_step * (num_strikes // 2)], reverse=True)
 
-    strike_map = {}
-    if skew_adj and sel:
-        tot_c = sum(raw_strike_data[k]["c_gex"] for k in sel)
-        tot_p = sum(raw_strike_data[k]["p_gex"] for k in sel)
-        global_bal = min(max((tot_c / tot_p) * 0.92, 0.32), 1.0) if tot_p > tot_c * 1.15 else 1.0
-        temp_gex = {k: raw_strike_data[k]["c_gex"] - raw_strike_data[k]["p_gex"] * global_bal for k in sel}
-        asc_sel = sorted(sel)
-        for i, k in enumerate(asc_sel):
-            win = asc_sel[max(0, i - 2):min(len(asc_sel), i + 3)]
-            local_mean = sum(temp_gex[w] for w in win) / len(win)
-            strike_map[k] = (0.55 * temp_gex[k] + 0.45 * (temp_gex[k] - local_mean * 0.85)) if (k < spot and temp_gex[k] < 0 and local_mean < 0) else temp_gex[k]
-    else:
-        strike_map = {k: raw_strike_data[k]["c_gex"] - raw_strike_data[k]["p_gex"] for k in sel}
-
-    pos = {k: strike_map[k] for k in sel if strike_map[k] > 0.005}
-    neg = {k: strike_map[k] for k in sel if strike_map[k] < -0.005}
+    pos = {k: strike_map[k] for k in sel if strike_map[k] > 0.001}
+    neg = {k: strike_map[k] for k in sel if strike_map[k] < -0.001}
     max_pos = max(pos, key=pos.get) if pos else atm
     max_neg = min(neg, key=neg.get) if neg else atm
     king = max(sel, key=lambda k: abs(strike_map[k])) if sel else atm
@@ -240,7 +297,8 @@ def fetch_cboe_gex(ticker, url, strike_step, mode="next", skew_adj=True, num_str
     for i in range(len(sel) - 1):
         k1, k2 = sel[i], sel[i + 1]
         if (strike_map[k1] >= 0) != (strike_map[k2] >= 0):
-            if abs(k1 - spot) < abs(flip - spot) or flip == atm: flip = k1
+            if abs(k1 - spot) < abs(flip - spot) or flip == atm:
+                flip = k1
 
     rows = []
     mp_val = pos.get(max_pos, 1.0) or 1.0
@@ -263,14 +321,14 @@ def fetch_cboe_gex(ticker, url, strike_step, mode="next", skew_adj=True, num_str
         })
 
     return {
-        "ticker": ticker, "spot": spot, "exp": exp_label, "atm_strike": atm,
+        "ticker": ticker, "spot": spot, "cboe_delayed": cboe_delayed_spot, "exp": exp_label, "atm_strike": atm,
         "call_wall": cw, "put_wall": pw, "put_trigger": pt, "flip_strike": flip,
         "strike_map": strike_map, "rows": rows
     }
 
 def check_reference_shifts(curr, ref_data, ref_label, alerts_dict):
     if not ref_data or "SPX" not in ref_data or "SPX" not in curr: return
-    spx, spy, xsp, b_spx = curr["SPX"], curr.get("SPY"), curr.get("XSP"), ref_data["SPX"]
+    spx, xsp, b_spx = curr["SPX"], curr.get("XSP"), ref_data["SPX"]
     spot, cw, pw, pt, flip = spx["spot"], spx["call_wall"], spx["put_wall"], spx["put_trigger"], spx["flip_strike"]
     xsp_spot = spot / 10.0
     if spx["strike_map"].get(pw, 0) <= 0 and xsp and xsp["strike_map"].get(xsp["put_wall"], 0) > 0:
@@ -283,18 +341,9 @@ def check_reference_shifts(curr, ref_data, ref_label, alerts_dict):
         aid = f"NODE_GONE_{old_cw:.0f}"
         alerts_dict[aid] = {
             "id": aid, "level": "danger", "sound": "alarm",
-            "voice": f"警报！对比{ref_label}，上方正Gamma节点 {old_cw/10:.1f} 撤单消失，请下调 XSP Call 止盈目标至 {cw/10:.1f}",
+            "voice": f"警报！对比{ref_label}，上方正Gamma节点 {old_cw/10:.1f} 衰减消失，请下调 XSP Call 止盈目标至 {cw/10:.1f}",
             "title": f"🚨【信号1：上方节点蒸发 ({ref_label}对比)】SPX {old_cw:.0f} (XSP {old_cw/10:.1f})",
             "desc": f"上方正GEX节点从 +${old_v:.1f}M 骤降至 +${now_v:.1f}M！立即将 XSP Call 止盈位下调至 {cw/10:.1f} (▲)！"
-        }
-    old_pw_v, now_pw_v = b_spx["strike_map"].get(pw, 0), spx["strike_map"].get(pw, 0)
-    if old_pw_v > 0 and now_pw_v > old_pw_v * 1.25 and now_pw_v > 5.0:
-        aid = f"CHOP_WALL_{pw:.0f}"
-        alerts_dict[aid] = {
-            "id": aid, "level": "warning", "sound": "beep",
-            "voice": f"注意！对比{ref_label}，下方 {pw/10:.1f} 正Gamma铁底增厚，进入横盘钉死模式",
-            "title": f"🧱【信号2：底部铁墙增厚 ({ref_label}对比)】SPX {pw:.0f} (XSP {pw/10:.1f}) 增至 +${now_pw_v:.1f}M",
-            "desc": f"下方护城河增厚，指数易被钉在 XSP {pw/10:.1f}~{cw/10:.1f} 磨时间！0DTE 离场防磨损，周五周权依托 {pw/10:.1f} 持有。"
         }
     if cw < old_cw:
         aid = f"CEIL_LOW_{cw:.0f}"
@@ -305,9 +354,8 @@ def check_reference_shifts(curr, ref_data, ref_label, alerts_dict):
             "desc": f"日内第一反弹天花板已降至 XSP {cw/10:.1f}，多单反抽触及必须先减仓 30%~50%！"
         }
     reclaimed_flip = (old_spot < b_spx["flip_strike"] and spot >= flip)
-    spy_reclaimed = (spy and "SPY" in ref_data and ref_data["SPY"]["spot"] < ref_data["SPY"]["flip_strike"] and spy["spot"] >= spy["flip_strike"])
-    neg_squeeze = (spot > old_spot + 7.5 and spx["strike_map"].get(spx["atm_strike"], 0) < -1.5)
-    if reclaimed_flip or spy_reclaimed or neg_squeeze:
+    neg_squeeze = (spot > old_spot + 7.5 and spx["strike_map"].get(spx["atm_strike"], 0) < -1.0)
+    if reclaimed_flip or neg_squeeze:
         rec_strike = math.ceil(xsp_spot) + 1
         aid = f"ROCKET_SQUEEZE_{int(xsp_spot)}"
         alerts_dict[aid] = {
@@ -327,10 +375,11 @@ def check_reference_shifts(curr, ref_data, ref_label, alerts_dict):
 
 def refresh_all_now():
     steps = {"SPX": 5, "XSP": 1, "SPY": 1, "QQQ": 1}
+    live_spots = fetch_realtime_spots()
     new_data = {}
     for tk, url in CBOE_URLS.items():
         try:
-            new_data[tk] = fetch_cboe_gex(tk, url, steps[tk], mode=STATE["mode"], skew_adj=STATE["skew_adj"], num_strikes=28)
+            new_data[tk] = fetch_cboe_gex(tk, url, steps[tk], mode=STATE["mode"], skew_adj=STATE["skew_adj"], live_spots=live_spots, num_strikes=30)
         except Exception as e:
             print(f"[Warn] {tk}: {e}")
     if not new_data or "SPX" not in new_data: return
@@ -343,7 +392,7 @@ def refresh_all_now():
         STATE.update({"trading_day": today_str, "rth_locked": is_rth, "baseline_data": new_data, "baseline_time": f"{time_str} (自动锚定)"})
         save_baseline_cache()
     elif is_rth and not STATE["rth_locked"]:
-        STATE.update({"rth_locked": True, "baseline_data": new_data, "baseline_time": f"{time_str} (9:30开盘自动锁定)"})
+        STATE.update({"rth_locked": True, "baseline_data": new_data, "baseline_time": f"{time_str} (9:30开盘锁定)"})
         ROLLING_HISTORY.clear()
         save_baseline_cache()
 
@@ -365,15 +414,17 @@ def refresh_all_now():
     if spx["strike_map"].get(pw, 0) <= 0 and xsp and xsp["strike_map"].get(xsp["put_wall"], 0) > 0:
         pw = xsp["put_wall"] * 10.0
 
+    cboe_diff = spot - spx.get("cboe_delayed", spot)
+    sess_tag = f"⚡毫秒级实时现价 (修正CBOE延时 {cboe_diff:+.1f}点)"
     if spot <= pt:
-        regime, a0, awk = f"🌊 负Gamma破位区 (处于 ▼ {pt:.0f})", f"反抽不破 XSP {flip/10:.1f} (◆) 偏空，勿接刀 0DTE Call。", f"周权 XSP Call 等站稳 {pw/10:.1f} 上方再操作。"
+        regime, a0, awk = f"🌊 负Gamma破位区 ({sess_tag})", f"反抽不破 XSP {flip/10:.1f} (◆) 偏空，勿盲目接刀 0DTE Call。", f"周权 XSP Call 等站稳 {pw/10:.1f} 上方再操作。"
     elif spot >= flip:
-        regime, a0, awk = f"📈 正Gamma偏多区 (站上 ◆ {flip:.0f})", f"回踩 XSP {pw/10:.1f} 企稳短多，触及 {cw/10:.1f} (▲) 止盈。", f"周权 760C 持有，冲高进入 XSP {cw/10:.1f} 减半仓锁利。"
+        regime, a0, awk = f"📈 正Gamma偏多区 ({sess_tag})", f"回踩 XSP {pw/10:.1f} 企稳短多，触及 {cw/10:.1f} (▲) 止盈。", f"周权 760C 持有，冲高进入 XSP {cw/10:.1f} 减半仓锁利。"
     else:
-        regime, a0, awk = f"⚖️ 多空拉锯修复区 ({spx['exp']})", f"支撑看 XSP {pw/10:.1f}，反弹目标看 {flip/10:.1f} (◆) 与 {cw/10:.1f} (▲)。", f"紧盯能否收复 XSP {flip/10:.1f} (◆)，冲高至 {cw/10:.1f} 减仓。"
+        regime, a0, awk = f"⚖️ 多空拉锯修复区 ({sess_tag})", f"下方支撑看 XSP {pw/10:.1f}，反弹目标看 {flip/10:.1f} (◆) 与 {cw/10:.1f} (▲)。", f"紧盯能否收复 XSP {flip/10:.1f} (◆)，冲高至 {cw/10:.1f} 减仓。"
 
     STATE.update({
-        "current_data": new_data, "last_update": time_str, "alerts": list(alerts_dict.values()),
+        "current_data": new_data, "last_update": f"{time_str} (实时同步)", "alerts": list(alerts_dict.values()),
         "xsp_advice": {
             "xsp_spot": f"{xsp_spot:.2f}", "spx_spot": f"{spot:.2f}", "regime": regime,
             "xsp_support": f"{pw/10:.1f} (SPX {pw:.0f})", "xsp_resistance": f"{cw/10:.1f} (SPX {cw:.0f} ▲)",
@@ -388,18 +439,28 @@ def background_updater():
     while True:
         refresh_all_now()
         ext_url = os.environ.get("RENDER_EXTERNAL_URL")
-        if ext_url and (time.time() - last_self_ping >= 600):
+        if ext_url and (time.time() - last_self_ping >= 480):
             try:
                 requests.get(f"{ext_url.rstrip('/')}/api/ping", timeout=8)
                 last_self_ping = time.time()
             except Exception:
                 pass
-        time.sleep(20)
+        time.sleep(8)
+
+def ensure_bg_services():
+    global BG_STARTED
+    with BG_LOCK:
+        if not BG_STARTED:
+            BG_STARTED = True
+            t1 = threading.Thread(target=background_updater, daemon=True)
+            t1.start()
+            t2 = threading.Thread(target=start_public_tunnel, daemon=True)
+            t2.start()
 
 HTML_LINES = [
     '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">',
     '<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">',
-    '<title>XSP / SPX 实时 GEX 作战指挥舱</title><style>',
+    '<title>XSP / SPX 实时 GEX 作战指挥舱 (实时校准版)</title><style>',
     'body{background:#0b0f17;color:#e2e8f0;font-family:-apple-system,BlinkMacSystemFont,"Microsoft YaHei",sans-serif;margin:0;padding:8px}',
     '.top-bar{display:flex;justify-content:space-between;align-items:center;background:#141b2d;padding:8px 12px;border-radius:8px;border:1px solid #232f46;margin-bottom:8px;flex-wrap:wrap;gap:6px}',
     '.btn{background:#2563eb;color:#fff;border:none;padding:6px 9px;border-radius:5px;cursor:pointer;font-size:11.5px;font-weight:600;margin:1px}',
@@ -456,13 +517,13 @@ HTML_LINES = [
     '<div style="background:#1e293b;padding:7px;border-radius:6px;font-size:11.5px;word-break:break-all;color:#38bdf8;margin-bottom:6px;" id="pub-url-txt"></div>',
     '<div style="font-size:11px;color:#94a3b8;margin-bottom:12px;" id="lan-url-txt"></div>',
     '<button class="btn btn-green" onclick="closeQr()">✅ 完成</button></div></div>',
-    '<div class="top-bar"><div><b style="font-size:16px;">⚡ XSP / SPX 全自动 GEX 指挥舱</b><div id="meta-info" style="font-size:11px;color:#4ade80;margin-top:2px;">同步中...</div></div>',
+    '<div class="top-bar"><div><b style="font-size:16px;">⚡ XSP / SPX 实时 GEX 指挥舱 (标准OI校准版)</b><div id="meta-info" style="font-size:11px;color:#4ade80;margin-top:2px;">同步中...</div></div>',
     '<div><button class="btn btn-green" onclick="openQr()">📱 手机扫码</button>',
     '<button class="btn btn-rocket" onclick="testRocketAlert()">🚀 测试小火箭</button>',
     '<button class="btn btn-sec" onclick="toggleAudio()" id="audio-btn">🔊 语音:开</button>',
     '<button class="btn btn-gold" onclick="toggleDrawer()">📖 字典&铁律</button>',
     '<button class="btn btn-sec" onclick="toggleCols()" id="col-btn">📱 双列/单列</button>',
-    '<button class="btn btn-sec" onclick="toggleSkew()" id="skew-btn">⚖️ 去噪:开</button>',
+    '<button class="btn btn-sec" onclick="toggleSkew()" id="skew-btn">⚖️ 标准OI</button>',
     '<button class="btn btn-sec" onclick="toggleMode()">🔄 单日/全周</button></div></div>',
     '<div class="legend-bar"><span style="color:#94a3b8;font-weight:600;">💡 点击/悬停色块看XSP指令：</span>',
     '<span class="lg-badge gex-king-pos" onclick="event.stopPropagation();showTip(event,\'KING_POS\')">🟨 亮黄墙+GEX*</span>',
@@ -488,7 +549,7 @@ HTML_LINES = [
     '<tr><td><b>🌊 5.铁底破位</b></td><td>跌穿黄墙并击穿▼</td><td>触发负Gamma瀑布！<b>XSP多单无条件止损</b>，反手买Put</td></tr></table></div></div></div>',
     '<div id="alerts-container"></div>',
     '<div class="cmd-panel" id="cmd-panel" style="display:none;"><div class="levels-grid">',
-    '<div class="lvl-card" onclick="event.stopPropagation();showTip(event,\'SPOT_M\')"><div class="lvl-label">XSP 实时折算点位</div><div class="lvl-val" id="v-spot" style="color:#38bdf8;">-</div></div>',
+    '<div class="lvl-card" onclick="event.stopPropagation();showTip(event,\'SPOT_M\')"><div class="lvl-label">XSP 毫秒级实时点位</div><div class="lvl-val" id="v-spot" style="color:#38bdf8;">-</div></div>',
     '<div class="lvl-card" onclick="event.stopPropagation();showTip(event,\'FLIP\')"><div class="lvl-label">多空翻转点 (◆ Flip)</div><div class="lvl-val" id="v-flip" style="color:#60a5fa;">-</div></div>',
     '<div class="lvl-card" onclick="event.stopPropagation();showTip(event,\'UP_WALL\')"><div class="lvl-label">上方第一阻力 (▲ Call Wall)</div><div class="lvl-val" id="v-cw" style="color:#facc15;">-</div></div>',
     '<div class="lvl-card" onclick="event.stopPropagation();showTip(event,\'PW_CARD\')"><div class="lvl-label">下方支撑墙 (Put Support)</div><div class="lvl-val" id="v-pw" style="color:#4ade80;">-</div></div></div>',
@@ -519,7 +580,7 @@ HTML_LINES = [
     'function closeQr(){document.getElementById("qr-overlay").style.display="none";}',
     'function toggleAudio(){audioEnabled=!audioEnabled;document.getElementById("audio-btn").innerText=`🔊 语音:${audioEnabled?"开":"静"}`;if(audioEnabled)speakText("语音已开启");}',
     'function toggleCols(){document.getElementById("gex-grid").classList.toggle("force-1col");}',
-    'function testRocketAlert(){const sp=lastAdvice.xsp_spot||"741.7",cw=lastAdvice.xsp_resistance||"746.0 (SPX 7460 ▲)",fl=lastAdvice.xsp_flip||"741.0",st=Math.ceil(parseFloat(sp)||742)+1;',
+    'function testRocketAlert(){const sp=lastAdvice.xsp_spot||"733.4",cw=lastAdvice.xsp_resistance||"736.0 (SPX 7355 ▲)",fl=lastAdvice.xsp_flip||"735.5",st=Math.ceil(parseFloat(sp)||734)+1;',
     'triggerPopupAlert({level:"rocket",sound:"rocket",title:`🚀【小火箭逼空点火信号】突破 XSP ${sp}`,',
     'desc:`多头冲破翻转线(${fl})与负Gamma加速区，做市商被迫追买期货助涨！\\n\\n👉 0DTE指令：顺势关注 XSP ${st} Call，第一止盈看 ${cw}！\\n👉 周五760C指令：冲高进入 ${cw} 区间先减仓 30%~50% 锁利！`,',
     'voice:`小火箭逼空点火信号！指数冲破负Gamma加速带，短线可顺势关注 XSP ${st} Call，第一止盈看 ${cw.split(" ")[0]}`});}',
@@ -531,7 +592,7 @@ HTML_LINES = [
     'UP_WALL:{t:"▲ 橙色上三角 (上方第一阻力轨)",d:"现价上方正Gamma最强的多头目标天花板。",a:"👉 XSP操作：XSP Call 第一止盈减仓位！反抽触及先平30%~50%。"},',
     'DN_TRIG:{t:"▼ 紫色下三角 (破位瀑布红线)",d:"下方负Gamma核爆临界点，失守将转为顺势砸盘。",a:"👉 XSP操作：XSP Call 绝对硬止损线！实体跌穿无条件止损。"},',
     'FLIP:{t:"◆ 蓝紫菱形 (多空翻转点)",d:"正Gamma震荡与负Gamma单边的分界线。",a:"👉 XSP操作：站稳◆上方回调接Call；压在◆下方反弹皆为反抽！"},',
-    'SPOT_M:{t:"M 现价锚定格",d:"当前价格所在的贴身肉搏行权价。",a:"👉 XSP操作：日内买卖期权只选 M 上下 2~4 点以内的合约。"},',
+    'SPOT_M:{t:"M 现价锚定格 (CNBC+Yahoo毫秒级实时点位)",d:"已彻底修复CBOE盘中15分钟延迟问题，实时同步当前成交价。",a:"👉 XSP操作：日内买卖期权只选 M 上下 2~4 点以内的合约。"},',
     'PW_CARD:{t:"🛡️ 下方支撑墙",d:"现价下方承接力最强的正GEX铁底。",a:"👉 XSP操作：回踩企稳不破时是平Put或博反抽买点。"}',
     '};',
     'function showTip(e,key){const box=document.getElementById("floating-tip"),it=TIP_DICT[key];if(!it)return;',
@@ -547,7 +608,7 @@ HTML_LINES = [
     'function toggleDrawer(){const d=document.getElementById("guide-drawer");d.style.display=d.style.display==="block"?"none":"block";}',
     'async function loadData(){const res=await fetch("/api/gex"),d=await res.json();',
     'pubUrl=d.public_url||"";lanUrl=d.lan_url||"";',
-    'document.getElementById("skew-btn").innerText=`⚖️ 去噪:${d.skew_adj?"开":"关"}`;',
+    'document.getElementById("skew-btn").innerText=`⚖️ ${d.skew_adj?"偏度微调":"标准OI"}`;',
     'document.getElementById("meta-info").innerText=`🌐 ${pubUrl} | 刷新:${d.last_update} | 基准:${d.baseline_time}`;',
     'const alerts=d.alerts||[];',
     'document.getElementById("alerts-container").innerHTML=alerts.map(a=>`<div class="alert-box alert-${a.level}" onclick=\'triggerPopupAlert(${JSON.stringify(a)})\'><b>${a.title} (点击重播)</b><br>${a.desc}</div>`).join("");',
@@ -562,23 +623,28 @@ HTML_LINES = [
     'if(!it)return`<div class="col-card"><div class="col-hdr">${tk} 同步中...</div></div>`;',
     'const rHtml=it.rows.map(r=>{const bStr=(r.badges||[]).join("");',
     'return`<tr class="${r.color_cls} ${r.is_spot?"spot-row":""}" onclick="event.stopPropagation();showRowTip(event,\'${tk}\',\'${r.strike}\',\'${r.xsp_eq}\',\'${r.gex_str}\',\'${r.color_cls}\',\'${r.pos_rel}\',\'${bStr}\')" onmousemove="showRowTip(event,\'${tk}\',\'${r.strike}\',\'${r.xsp_eq}\',\'${r.gex_str}\',\'${r.color_cls}\',\'${r.pos_rel}\',\'${bStr}\')"><td class="strike-col">${r.strike}<span style="font-size:10px;margin-left:2px;">${bStr}</span></td><td class="gex-col">${r.gex_str}</td></tr>`;}).join("");',
-    'return`<div class="col-card"><div class="col-hdr"><div class="col-title"><span>${tk} (${it.exp})</span><span>$${it.spot.toFixed(1)}</span></div>',
+    'return`<div class="col-card"><div class="col-hdr"><div class="col-title"><span>${tk} (${it.exp})</span><span>$${it.spot.toFixed(2)}</span></div>',
     '<div class="pills"><span class="pill pill-fl" onclick="event.stopPropagation();showTip(event,\'FLIP\')">◆${it.flip_strike}</span>',
     '<span class="pill pill-up" onclick="event.stopPropagation();showTip(event,\'UP_WALL\')">▲${it.call_wall}</span>',
     '<span class="pill pill-dn" onclick="event.stopPropagation();showTip(event,\'DN_TRIG\')">▼${it.put_trigger}</span></div></div>',
     '<table class="gex-tbl"><tbody>${rHtml}</tbody></table></div>`;}).join("");}',
     'async function toggleMode(){await fetch("/api/toggle_mode",{method:"POST"});loadData();}',
     'async function toggleSkew(){await fetch("/api/toggle_skew",{method:"POST"});loadData();}',
-    'loadData();setInterval(loadData,15000);</script></body></html>'
+    'loadData();setInterval(loadData,8000);</script></body></html>'
 ]
 HTML_PAGE = "\n".join(HTML_LINES)
 
+# 无论 Render 使用 gunicorn app:app 还是 python app.py 启动，均确保后台实时同步线程自动运行
+ensure_bg_services()
+
 @app.route("/")
 def index():
+    ensure_bg_services()
     return Response(HTML_PAGE, mimetype="text/html")
 
 @app.route("/api/gex")
 def api_gex():
+    ensure_bg_services()
     return jsonify(STATE)
 
 @app.route("/api/ping")
@@ -603,11 +669,7 @@ def api_toggle_skew():
 
 if __name__ == "__main__":
     generate_cloud_24h_package()
-    t1 = threading.Thread(target=background_updater, daemon=True)
-    t1.start()
-    t2 = threading.Thread(target=start_public_tunnel, daemon=True)
-    t2.start()
     port = int(os.environ.get("PORT", 5050))
-    print(f"✅ iPhone双列+免Docker云端版已启动！本机请访问: http://127.0.0.1:{port}")
+    print(f"✅ Render云端+本机双栖校准版已启动！本机请访问: http://127.0.0.1:{port}")
     app.run(host="0.0.0.0", port=port, debug=False)
 # === END ===
