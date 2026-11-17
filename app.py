@@ -1,3 +1,5 @@
+import os
+import subprocess
 import math
 import time
 import threading
@@ -8,8 +10,8 @@ from flask import Flask, jsonify, render_template_string
 
 app = Flask(__name__)
 
-# ==================== 全局核心开关 (已彻底移除无用的 SKEW) ====================
-LIVE_FLOW_MODE = True     # True = StrikeGEX同款动态盘口流向染色 | False = 传统静态(Call正/Put负)
+# ==================== 全局核心开关 ====================
+LIVE_FLOW_MODE = True     # True = StrikeGEX动态盘口流向(增量账本稳态版) | False = 传统静态(Call正/Put负)
 NOISE_REDUCTION = True    # True = 过滤远端噪音，聚焦ATM核心博弈区
 
 TICKERS = {
@@ -22,23 +24,48 @@ TICKERS = {
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
+    "Cache-Control": "no-cache",
 }
 
-# ==================== 内存高速缓存池 ====================
-RAW_CHAIN_CACHE = {}      # 缓存过滤后的近端期权链原始数据 (供按钮秒切重算)
-SPOT_CACHE = {}           # 缓存实时现价与涨跌幅
-RENDER_CACHE = {}         # 缓存最终计算好的前端渲染数据 (<2ms 直出)
-BASELINE_MEMORY = {}      # 缓存关键节点用于小火箭逼空与破位预警
-LAST_UPDATE_STR = "加载中..."
+# ==================== 内存持久化状态池 (防闪烁/防回退) ====================
+RAW_CHAIN_CACHE = {}      # 缓存经过防倒退校验的CBOE期权链
+CHAIN_VOL_STAMP = {}      # 记录每个标的最大累计成交量，拦截落后的CDN旧节点
+FLOW_LEDGER = {}          # 增量订单流账本: {opt_sym: {"vol": float, "signed_vol": float}}
+EMA_GEX_CACHE = {}        # 行权价级别EMA平滑缓存: {(ticker, strike): float}
+SPOT_CACHE = {}           # 持久化最新实时现价(永不回退15分钟延迟价)
+RENDER_CACHE = {}         # 前端秒读缓存
+BASELINE_MEMORY = {}      # 破位与小火箭预警记忆
+LAST_UPDATE_STR = "同步中..."
 CACHE_LOCK = threading.Lock()
 
 
+# ==================== 0. 启动自检：自动清理占用5000端口的旧幽灵进程 ====================
+def kill_stale_port_5000():
+    if os.name != "nt":
+        return
+    my_pid = os.getpid()
+    try:
+        out = subprocess.check_output("netstat -ano | findstr :5000", shell=True, text=True)
+        killed = set()
+        for line in out.strip().splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and "LISTENING" in parts:
+                pid = int(parts[-1])
+                if pid != my_pid and pid > 0 and pid not in killed:
+                    subprocess.run(f"taskkill /F /PID {pid}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    killed.add(pid)
+        if killed:
+            print(f"🧹 已自动清理后台残留的旧端口进程 PID: {killed}，防止双进程画面闪烁！")
+            time.sleep(0.5)
+    except Exception:
+        pass
+
+
 def get_us_eastern_now():
-    """强制获取美东时间(EST/EDT)，防止本地时区跨日导致0DTE期权被误删"""
     return datetime.now(timezone.utc) - timedelta(hours=5)
 
 
-# ==================== 1. 并发极速现价抓取 ====================
+# ==================== 1. 实时现价抓取 (带持久化防回退锁) ====================
 def fetch_single_spot(key, yf_sym):
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yf_sym}?interval=1m&range=1d"
@@ -60,17 +87,17 @@ def update_all_spots():
         futures = [ex.submit(fetch_single_spot, k, cfg["yf"]) for k, cfg in TICKERS.items()]
         for f in futures:
             k, price, pct = f.result()
-            if price:
+            if price and price > 0:
                 SPOT_CACHE[k] = {"spot": price, "pct": pct}
 
-    # SPX 与 XSP 10:1 互为实时兜底
+    # SPX 与 XSP 互为实时镜像兜底
     if "SPX" in SPOT_CACHE and "XSP" not in SPOT_CACHE:
         SPOT_CACHE["XSP"] = {"spot": round(SPOT_CACHE["SPX"]["spot"] / 10.0, 2), "pct": SPOT_CACHE["SPX"]["pct"]}
     elif "XSP" in SPOT_CACHE and "SPX" not in SPOT_CACHE:
         SPOT_CACHE["SPX"] = {"spot": round(SPOT_CACHE["XSP"]["spot"] * 10.0, 2), "pct": SPOT_CACHE["XSP"]["pct"]}
 
 
-# ==================== 2. Black-Scholes 实时 Gamma 补偿 ====================
+# ==================== 2. Black-Scholes Gamma 补偿 ====================
 def bs_live_gamma(spot, strike, iv, t_years):
     if spot <= 0 or strike <= 0 or iv <= 0 or t_years <= 0:
         return 0.0
@@ -83,20 +110,21 @@ def bs_live_gamma(spot, strike, iv, t_years):
         return 0.0
 
 
-# ==================== 3. CBOE 期权链极速下载与预过滤 ====================
+# ==================== 3. CBOE 期权链拉取 (带 CDN 防时光倒流校验) ====================
 def fetch_cboe_raw_chain(ticker_key):
-    """下载单个标的CBOE数据，并在入口处直接剔除95%远端无效合约"""
     cfg = TICKERS[ticker_key]
     cboe_sym = cfg["cboe"]
+    # 固定优先使用主CDN路径，带时间戳桶减少跨节点乱跳
+    ts_bucket = int(time.time() // 5)
     urls = [
-        f"https://cdn.cboe.com/api/global/delayed_quotes/options/{cboe_sym}.json",
-        f"https://cdn.cboe.com/api/global/delayed_quotes/options/{cboe_sym.replace('_', '')}.json",
+        f"https://cdn.cboe.com/api/global/delayed_quotes/options/{cboe_sym}.json?_={ts_bucket}",
+        f"https://cdn.cboe.com/api/global/delayed_quotes/options/{cboe_sym.replace('_', '')}.json?_={ts_bucket}",
     ]
 
     raw_json = None
     for url in urls:
         try:
-            r = requests.get(url, headers=HEADERS, timeout=(2.5, 5.0))
+            r = requests.get(url, headers=HEADERS, timeout=(2.5, 4.5))
             if r.status_code == 200:
                 raw_json = r.json()
                 break
@@ -108,8 +136,11 @@ def fetch_cboe_raw_chain(ticker_key):
 
     data_block = raw_json["data"]
     cboe_spot = float(data_block.get("current_price") or 0)
-    live_info = SPOT_CACHE.get(ticker_key, {})
-    spot = live_info.get("spot") or cboe_spot
+    # 只要 SPOT_CACHE 有实时价，永远优先用实时价，绝不退回15分钟延迟的 cboe_spot
+    if ticker_key not in SPOT_CACHE and cboe_spot > 0:
+        SPOT_CACHE[ticker_key] = {"spot": cboe_spot, "pct": 0.0}
+
+    spot = SPOT_CACHE.get(ticker_key, {}).get("spot") or cboe_spot
     if spot <= 0:
         return False
 
@@ -119,10 +150,11 @@ def fetch_cboe_raw_chain(ticker_key):
 
     est_now = get_us_eastern_now()
     today_yymmdd = est_now.strftime("%y%m%d")
-    max_dist = spot * 0.06  # 仅保留现价 ±6% 以内的核心合约，提速10倍
+    max_dist = spot * 0.06
 
     filtered_opts = []
     avail_dates = set()
+    total_chain_vol = 0.0
 
     for opt in options:
         sym = opt.get("option", "")
@@ -139,22 +171,31 @@ def fetch_cboe_raw_chain(ticker_key):
         except ValueError:
             continue
 
-        # 入口极速过滤：远离现价的深度虚值合约直接跳过
         if abs(strike - spot) > max_dist:
             continue
 
+        vol = float(opt.get("volume", 0) or 0)
+        total_chain_vol += vol
         avail_dates.add(yymmdd)
-        filtered_opts.append((yymmdd, opt_type, strike, opt))
+        filtered_opts.append((sym, yymmdd, opt_type, strike, opt))
 
     if not avail_dates:
         return False
+
+    # 🔒 CDN 边缘节点防倒退锁：如果本次拉取的快照总成交量小于已缓存快照，说明命中了落后的旧CDN节点，直接丢弃！
+    prev_max_vol = CHAIN_VOL_STAMP.get(ticker_key, 0.0)
+    if total_chain_vol < prev_max_vol * 0.998 and ticker_key in RAW_CHAIN_CACHE:
+        return True
+    CHAIN_VOL_STAMP[ticker_key] = max(prev_max_vol, total_chain_vol)
 
     sorted_dates = sorted(list(avail_dates))
     target_d = sorted_dates[0]
     next_d = sorted_dates[1] if len(sorted_dates) > 1 else target_d
 
-    # 仅保留最近两个到期日的近端合约存入内存
-    near_opts = [item for item in filtered_opts if item[0] in (target_d, next_d)]
+    near_opts = [item for item in filtered_opts if item[1] in (target_d, next_d)]
+
+    # 同步初始化/更新增量订单流账本 (FLOW_LEDGER)
+    update_flow_ledger(near_opts, spot)
 
     RAW_CHAIN_CACHE[ticker_key] = {
         "cboe_spot": cboe_spot,
@@ -166,8 +207,61 @@ def fetch_cboe_raw_chain(ticker_key):
     return True
 
 
-# ==================== 4. 内存级毫秒重算引擎 (支持按钮0延迟切换) ====================
-def compute_ticker_gex(ticker_key):
+# ==================== 4. 增量订单流账本 (根治全量Volume正负乱跳) ====================
+def calc_contract_flow_sign(opt_type, strike, spot, opt):
+    """计算单笔/当前状态盘口多空极性 ∈ [-1.0, +1.0]"""
+    static_sign = 1.0 if opt_type == "C" else -1.0
+    bid = float(opt.get("bid", 0) or 0)
+    ask = float(opt.get("ask", 0) or 0)
+    last_p = float(opt.get("last_trade_price", 0) or 0)
+    prev_close = float(opt.get("prev_day_close", 0) or 0)
+
+    # 1. 盘口 Bid/Ask 报价位置因子
+    quote_sign = static_sign
+    if ask > bid and bid > 0 and last_p > 0:
+        spread = max(ask - bid, 0.01)
+        # 限制在 [0.15, 0.85] 温和区间，防止单笔越界报价引发极端跳变
+        ask_pos = max(0.0, min(1.0, (last_p - bid) / spread))
+        quote_sign = 1.0 - 2.0 * ask_pos
+
+    # 2. 日内合约价格涨跌动量因子 (最稳健的资金流向锚：期权大涨=主动买盘Ask主导=-GEX；期权大跌=主动卖盘Bid主导=+GEX)
+    mom_sign = static_sign
+    if last_p > 0 and prev_close > 0:
+        chg = (last_p - prev_close) / max(prev_close, 0.05)
+        if chg > 0.12:
+            mom_sign = -0.85  # 客户主动扫货买入 -> 做市商 Short Gamma (-GEX)
+        elif chg < -0.12:
+            mom_sign = 0.85   # 客户主动砸盘卖出/平仓 -> 做市商 Long Gamma (+GEX 黄色护盘)
+
+    # 60% 稳态涨跌动量 + 40% 盘口报价位置，彻底告别单笔tick反转
+    return 0.60 * mom_sign + 0.40 * quote_sign
+
+
+def update_flow_ledger(near_opts, spot):
+    for sym, yymmdd, opt_type, strike, opt in near_opts:
+        vol = float(opt.get("volume", 0) or 0)
+        cur_sign = calc_contract_flow_sign(opt_type, strike, spot, opt)
+
+        rec = FLOW_LEDGER.get(sym)
+        if rec is None:
+            # 首次建账：以稳态混合极性锁定初始已沉淀成交量
+            FLOW_LEDGER[sym] = {
+                "vol": vol,
+                "signed_vol": vol * cur_sign,
+            }
+        else:
+            delta_vol = vol - rec["vol"]
+            if delta_vol > 0:
+                # 核心：只有新增的成交量(delta_vol)按最新盘口方向累加，历史已成交底仓绝不乱跳！
+                rec["signed_vol"] += delta_vol * cur_sign
+                rec["vol"] = vol
+            else:
+                # 无新增成交时，仅做 3% 微幅阻尼修正，保持画面极度稳定
+                rec["signed_vol"] = 0.97 * rec["signed_vol"] + 0.03 * (vol * cur_sign)
+
+
+# ==================== 5. 内存级 GEX 计算引擎 ====================
+def compute_ticker_gex(ticker_key, use_ema=True):
     raw = RAW_CHAIN_CACHE.get(ticker_key)
     if not raw:
         return None
@@ -186,58 +280,44 @@ def compute_ticker_gex(ticker_key):
     t_0dte = max(hours_left / (252.0 * 6.5), 1.0 / (252.0 * 24.0))
 
     strike_buckets = {}
-    vol_weight = 1.65 if NOISE_REDUCTION else 0.85
+    vol_weight = 1.35 if NOISE_REDUCTION else 0.75
 
-    for yymmdd, opt_type, strike, opt in raw["near_opts"]:
+    for sym, yymmdd, opt_type, strike, opt in raw["near_opts"]:
         date_factor = 1.0 if yymmdd == target_d else 0.35
         grid_strike = round(round(strike / step) * step, 2)
 
         oi = float(opt.get("open_interest", 0) or 0)
         vol = float(opt.get("volume", 0) or 0)
-        bid = float(opt.get("bid", 0) or 0)
-        ask = float(opt.get("ask", 0) or 0)
-        last_p = float(opt.get("last_trade_price", 0) or 0)
-        prev_close = float(opt.get("prev_day_close", 0) or 0)
         iv = float(opt.get("iv", 0) or 0.18)
+        if iv > 3.0:
+            iv = iv * 0.01
         raw_gamma = float(opt.get("gamma", 0) or 0)
 
         t_exp = t_0dte if yymmdd == target_d else (t_0dte + 1.0 / 252.0)
         gamma = bs_live_gamma(spot, strike, max(iv, 0.05), t_exp) if raw_gamma <= 1e-6 else raw_gamma
 
-        # 原代码 (多乘了一次 spot):
-        # unit_gex = gamma * (spot * spot) * 0.000001 * date_factor
-
-        # 修正后 (标准每点美元Gamma量级，SPX/SPY/QQQ/XSP 全部恢复标准 $M / $K 显示):
-        scale_fix = 0.12 if ticker_key == "SPX" else (1.5 if ticker_key == "XSP" else 0.75)
-        unit_gex = gamma * spot * 0.000001 * date_factor * scale_fix
+        # ✅ 已修复数值量级：使用标准单点美元Gamma (spot * 1e-6)，与 StrikeGEX 的 $M / $K 1:1 对齐
+        unit_gex = gamma * spot * 0.000001 * date_factor
         static_sign = 1.0 if opt_type == "C" else -1.0
 
         if not LIVE_FLOW_MODE:
-            # 传统静态模式：Call 恒正 / Put 恒负
             eff_qty = oi + vol * vol_weight
             gex_m = unit_gex * eff_qty * static_sign
-            flow_score = static_sign
+            flow_score = static_sign * vol
         else:
-            # ⚡ StrikeGEX 动态盘口流向模式 (OI底仓 + Bid/Ask主动成交极性)
-            oi_keep = 0.32 if NOISE_REDUCTION else 0.55
+            oi_keep = 0.40 if NOISE_REDUCTION else 0.65
             oi_gex = unit_gex * (oi * oi_keep) * static_sign
 
-            if ask > bid and bid > 0 and last_p > 0:
-                spread = max(ask - bid, 0.01)
-                ask_aggression = max(0.0, min(1.0, (last_p - bid) / spread))
-                mm_flow_sign = 1.0 - 2.0 * ask_aggression
-            elif last_p > 0 and prev_close > 0:
-                chg_ratio = (last_p - prev_close) / max(prev_close, 0.05)
-                mm_flow_sign = -1.0 if chg_ratio > 0.15 else (0.75 if chg_ratio < -0.15 else static_sign)
-            else:
-                mm_flow_sign = static_sign
+            # 从持久化增量账本读取稳定的净流向成交量
+            ledger_rec = FLOW_LEDGER.get(sym)
+            signed_vol = ledger_rec["signed_vol"] if ledger_rec else (vol * static_sign)
 
             dist_pct = abs(strike - spot) / spot
-            flow_boost = 2.35 if dist_pct <= 0.018 else 1.25
-            vol_gex = unit_gex * (vol * vol_weight * flow_boost) * mm_flow_sign
+            flow_boost = 1.85 if dist_pct <= 0.018 else 1.15
+            vol_gex = unit_gex * (signed_vol * vol_weight * flow_boost)
 
             gex_m = oi_gex + vol_gex
-            flow_score = mm_flow_sign
+            flow_score = signed_vol
 
         b = strike_buckets.get(grid_strike)
         if b is None:
@@ -249,7 +329,7 @@ def compute_ticker_gex(ticker_key):
             strike_buckets[grid_strike] = b
 
         b["net_gex"] += gex_m
-        b["flow_weighted"] += flow_score * vol
+        b["flow_weighted"] += flow_score
         b["vol_total"] += vol
         if opt_type == "C":
             b["call_oi"] += int(oi)
@@ -264,10 +344,20 @@ def compute_ticker_gex(ticker_key):
     rows = []
     for s in ladder_strikes:
         b = strike_buckets.get(s)
+        raw_val = b["net_gex"] if b else 0.0
+
+        # EMA 阻尼平滑：75% 延续上一帧 + 25% 吸收新变化（手动切换按钮时跳过EMA立即响应）
+        ema_key = (ticker_key, s, LIVE_FLOW_MODE, NOISE_REDUCTION)
+        if use_ema and ema_key in EMA_GEX_CACHE:
+            smoothed_val = 0.75 * EMA_GEX_CACHE[ema_key] + 0.25 * raw_val
+        else:
+            smoothed_val = raw_val
+        EMA_GEX_CACHE[ema_key] = smoothed_val
+
         if b:
             avg_flow = (b["flow_weighted"] / b["vol_total"]) if b["vol_total"] > 0 else 0.0
             rows.append({
-                "strike": s, "net_gex": b["net_gex"],
+                "strike": s, "net_gex": smoothed_val,
                 "call_oi": b["call_oi"], "put_oi": b["put_oi"],
                 "call_vol": b["call_vol"], "put_vol": b["put_vol"],
                 "avg_flow": round(avg_flow, 2),
@@ -338,35 +428,33 @@ def compute_ticker_gex(ticker_key):
     }
 
 
-def rebuild_render_cache():
-    """基于内存期权链瞬间重算4个标的 (<5ms)"""
+def rebuild_render_cache(use_ema=True):
     global LAST_UPDATE_STR
     new_render = {}
     for k in ["SPX", "XSP", "SPY", "QQQ"]:
-        res = compute_ticker_gex(k)
+        res = compute_ticker_gex(k, use_ema=use_ema)
         if res:
             new_render[k] = res
         elif k in RENDER_CACHE:
-            new_render[k] = RENDER_CACHE[k]  # 防掉线保护
+            new_render[k] = RENDER_CACHE[k]
     with CACHE_LOCK:
         RENDER_CACHE.update(new_render)
         LAST_UPDATE_STR = datetime.now().strftime("%H:%M:%S")
 
 
 def background_sync_worker():
-    """后台独立并发拉取线程：绝不阻塞前端网页"""
     while True:
         try:
             update_all_spots()
             with ThreadPoolExecutor(max_workers=4) as ex:
                 list(ex.map(fetch_cboe_raw_chain, ["SPX", "XSP", "SPY", "QQQ"]))
-            rebuild_render_cache()
+            rebuild_render_cache(use_ema=True)
         except Exception as e:
             print("Background sync warning:", e)
-        time.sleep(3.5)
+        time.sleep(5.0)
 
 
-# ==================== 5. Flask 极速非阻塞路由 ====================
+# ==================== 6. Flask 极速路由 ====================
 @app.route("/api/gex")
 def api_gex():
     with CACHE_LOCK:
@@ -391,7 +479,7 @@ def api_gex():
 def toggle_flow():
     global LIVE_FLOW_MODE
     LIVE_FLOW_MODE = not LIVE_FLOW_MODE
-    rebuild_render_cache()  # 内存直接秒切，无需重新下载
+    rebuild_render_cache(use_ema=False)
     return jsonify({"status": "ok", "live_flow_mode": LIVE_FLOW_MODE})
 
 
@@ -399,11 +487,11 @@ def toggle_flow():
 def toggle_noise():
     global NOISE_REDUCTION
     NOISE_REDUCTION = not NOISE_REDUCTION
-    rebuild_render_cache()  # 内存直接秒切，无需重新下载
+    rebuild_render_cache(use_ema=False)
     return jsonify({"status": "ok", "noise_reduction": NOISE_REDUCTION})
 
 
-# ==================== 6. 前端界面 (已砍掉 SKEW + 防拥堵秒刷) ====================
+# ==================== 7. 前端可视化界面 ====================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -588,6 +676,8 @@ HTML_TEMPLATE = """
   }
   .alert-banner {
     display: none;
+    justify-content: space-between;
+    align-items: center;
     background: #7c2d12;
     border: 1px solid #f97316;
     color: #ffedd5;
@@ -613,15 +703,19 @@ HTML_TEMPLATE = """
   </div>
 </div>
 
-<div id="alertBox" class="alert-banner"></div>
+<div id="alertBox" class="alert-banner">
+  <span id="alertText"></span>
+  <span style="cursor:pointer; padding:0 6px;" onclick="document.getElementById('alertBox').style.display='none'">✖</span>
+</div>
 <div id="grid" class="grid-container">
-  <div class="loading-box">⚡ 正在并发同步 CBOE 四标的期权链内存快照 (约 1~2 秒)...</div>
+  <div class="loading-box">⚡ 正在同步 CBOE 四标的期权链稳态快照 (约 1~2 秒)...</div>
 </div>
 <div id="tooltip"></div>
 
 <script>
 let soundEnabled = false;
 let isFetching = false;
+let lastSpokenAlert = "";
 
 function formatGex(val) {
   const absV = Math.abs(val);
@@ -662,7 +756,8 @@ function toggleSound() {
 }
 
 function speakAlert(text) {
-  if (!soundEnabled || !("speechSynthesis" in window)) return;
+  if (!soundEnabled || !("speechSynthesis" in window) || text === lastSpokenAlert) return;
+  lastSpokenAlert = text;
   const utter = new SpeechSynthesisUtterance(text);
   utter.lang = "zh-CN";
   utter.rate = 1.15;
@@ -672,8 +767,8 @@ function speakAlert(text) {
 function showTooltip(e, ticker, row) {
   const tt = document.getElementById("tooltip");
   let flowDesc = "⚪ 盘口均衡";
-  if (row.avg_flow > 0.15) flowDesc = "🟡 抄底/平仓护盘 (Bid主动卖盘)";
-  else if (row.avg_flow < -0.15) flowDesc = "🟣 空头扫货加速 (Ask主动买盘)";
+  if (row.avg_flow > 0.12) flowDesc = "🟡 抄底/平仓护盘 (Bid主动卖盘)";
+  else if (row.avg_flow < -0.12) flowDesc = "🟣 空头扫货加速 (Ask主动买盘)";
 
   tt.innerHTML = `
     <div style="font-weight:800; color:#38bdf8; margin-bottom:4px;">${ticker} Strike ${row.strike}</div>
@@ -712,12 +807,11 @@ async function fetchGexData(force = false) {
     if (!json.ready) return;
 
     const alertBox = document.getElementById("alertBox");
+    const alertText = document.getElementById("alertText");
     if (json.alerts && json.alerts.length > 0) {
-      alertBox.style.display = "block";
-      alertBox.innerText = json.alerts.join("  |  ");
+      alertBox.style.display = "flex";
+      alertText.innerText = json.alerts.join("  |  ");
       speakAlert(json.alerts[0]);
-    } else {
-      alertBox.style.display = "none";
     }
 
     const order = ["SPX", "XSP", "SPY", "QQQ"];
@@ -794,7 +888,7 @@ async function fetchGexData(force = false) {
 }
 
 fetchGexData();
-setInterval(fetchGexData, 2000);
+setInterval(fetchGexData, 2500);
 </script>
 </body>
 </html>
@@ -807,11 +901,11 @@ def index():
 
 
 if __name__ == "__main__":
-    # 启动独立后台并发同步线程
+    kill_stale_port_5000()
     t = threading.Thread(target=background_sync_worker, daemon=True)
     t.start()
     print("=========================================================")
-    print("🚀 XSP/SPX GEX 极速内存版 (StrikeGEX Live Flow) 已启动")
+    print("🚀 XSP/SPX GEX 稳态防闪烁版 (StrikeGEX Live Flow) 已启动")
     print("👉 请在浏览器打开: http://127.0.0.1:5000")
     print("=========================================================")
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
