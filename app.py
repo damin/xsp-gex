@@ -36,7 +36,7 @@ FLOW_LEDGER = {}          # 增量订单流账本: {opt_sym: {"vol": float, "sig
 EMA_GEX_CACHE = {}        # 行权价级别EMA平滑缓存
 SPOT_CACHE = {}           # 实时现价缓存
 RENDER_CACHE = {}         # 前端秒读缓存
-INTRADAY_ANCHOR = {}      # 盘中主力移仓对比基准: {(ticker, target_d): {strike: day_gex, "cw": x, "pw": y}}
+INTRADAY_ANCHOR = {}      # 盘中主力移仓对比基准
 ALERT_COOLDOWN = {}       # 智能语音冷却锁
 AVAIL_DATES_LIST = []
 ACTIVE_AUTO_DATE = ""
@@ -335,7 +335,6 @@ def resolve_active_dates(avail_dates, est_now):
 
 
 def extract_profile_nodes(ladder_strikes, gex_map, spot, step):
-    """通用关键节点提取函数：计算任一周期的 Call Wall, Put Wall, Zero Flip, King Node, Top3极值"""
     pos_s = [s for s in ladder_strikes if gex_map.get(s, 0.0) > 0]
     neg_s = [s for s in ladder_strikes if gex_map.get(s, 0.0) < 0]
     center_s = round(round(spot / step) * step, 2)
@@ -348,7 +347,6 @@ def extract_profile_nodes(ladder_strikes, gex_map, spot, step):
     min_neg = min((gex_map[s] for s in neg_s), default=0.0)
     max_abs = max((abs(gex_map.get(s, 0.0)) for s in ladder_strikes), default=1.0) or 1.0
 
-    # Zero Gamma Flip
     flip = center_s
     min_dist = 1e9
     for i in range(len(ladder_strikes) - 1):
@@ -371,17 +369,19 @@ def extract_profile_nodes(ladder_strikes, gex_map, spot, step):
     }
 
 
-# ==================== 6. 全动态双周期共振 + 盘中移仓算法引擎 ====================
+# ==================== 6. Top-1 唯一主靶心收敛 + 盘中移仓追踪引擎 ====================
 def analyze_dynamic_resonance_and_shifts(ticker_key, target_d, spot, step, ladder_strikes, day_map, week_map, day_meta, week_meta):
     """
-    100% 动态算法（零硬编码点位）：
-    1. 识别【单日 vs 本周OPEX】同频共振墙 (🎯)
-    2. 识别【日黄周紫 / 日紫周黄】跨周期极性背离陷阱 (⚠️ / 🛡️)
-    3. 识别【盘中主力移仓 / 支撑蒸发 / 负Gamma真空滑梯】 (🔄 / 🟣)
+    严格去伪存真算法：
+    - 每列上方最多只评出 1 个【多头1号共振主靶心 🎯】
+    - 每列下方最多只评出 1 个【空头1号共振主靶心 🎯】
+    - 每列最多 1 个【最强护盘铁底 🛡️】与 1 个【最大日黄周紫背离墙 ⚠️】
+    - 次级共振点位仅在鼠标悬停 Tooltip 中显示详情，绝不污染主界面图标
     """
     now_ts = time.time()
     dynamic_alerts = []
-    strike_tags = {}   # {strike: {"icon": str, "note": str}}
+    strike_notes = {s: [] for s in ladder_strikes}
+    strike_icons = {s: "" for s in ladder_strikes}
 
     def trigger_voice_once(key_id, msg, cooldown=180):
         last_t = ALERT_COOLDOWN.get(key_id, 0)
@@ -389,7 +389,7 @@ def analyze_dynamic_resonance_and_shifts(ticker_key, target_d, spot, step, ladde
             ALERT_COOLDOWN[key_id] = now_ts
             dynamic_alerts.append(msg)
 
-    # --- A. 盘中主力移仓基准比对 (Intraday Anchor Shift) ---
+    # --- A. 盘中主力移仓基准比对 ---
     anchor_key = (ticker_key, target_d)
     anchor = INTRADAY_ANCHOR.get(anchor_key)
     if anchor is None:
@@ -402,7 +402,6 @@ def analyze_dynamic_resonance_and_shifts(ticker_key, target_d, spot, step, ladde
         }
         anchor = INTRADAY_ANCHOR[anchor_key]
     else:
-        # 检测主力日内移仓：Call Wall 上移 或 Put Wall 下移
         if day_meta["cw"] > anchor["cw"] and spot > anchor["spot"]:
             trigger_voice_once(
                 f"{ticker_key}_CW_UP_{day_meta['cw']}",
@@ -416,7 +415,13 @@ def analyze_dynamic_resonance_and_shifts(ticker_key, target_d, spot, step, ladde
             )
             anchor["pw"] = day_meta["pw"]
 
-    # --- B. 逐档扫描：双周期共振 (🎯)、日周背离 (⚠️/🛡️)、主力移仓 (🔄) ---
+    # --- B. 候选池打分：选出全列唯一的 Top-1 上方主靶心 & Top-1 下方主靶心 ---
+    pos_res_candidates = []  # (score, strike)
+    neg_res_candidates = []  # (score, strike)
+    shield_candidates = []   # (score, strike) 下方卖Put护盘铁底
+    trap_candidates = []     # (score, strike) 上方日黄周紫诱多墙
+    shift_candidates = []    # (score, strike) 盘中大幅移仓
+
     for s in ladder_strikes:
         d_val = day_map.get(s, 0.0)
         w_val = week_map.get(s, 0.0)
@@ -424,112 +429,141 @@ def analyze_dynamic_resonance_and_shifts(ticker_key, target_d, spot, step, ladde
         w_norm = abs(w_val) / week_meta["max_abs"]
         old_d_val = anchor["gex_map"].get(s, d_val)
 
-        notes = []
-        icon = ""
-
-        # 1. 双周期正 Gamma 共振 (单日与全周同为强正GEX)
-        if d_val > 0 and w_val > 0 and ((s in day_meta["top_pos"] and s in week_meta["top_pos"]) or (d_norm > 0.45 and w_norm > 0.45)):
-            icon = "🎯"
-            if s <= spot:
-                notes.append(f"🎯 双周期共振铁底：单日({fmt_gex_str(d_val)})与全周({fmt_gex_str(w_val)})多头联合护盘，回踩强支撑/空单止盈区")
+        # 1. 同向正 Gamma 共振评分
+        if d_val > 0 and w_val > 0 and d_norm > 0.20 and w_norm > 0.20:
+            wall_boost = 1.35 if (s == day_meta["cw"] or s == week_meta["cw"]) else 1.0
+            score = math.sqrt(d_norm * w_norm) * wall_boost
+            if s >= spot - step * 0.5:
+                pos_res_candidates.append((score, s))
+                strike_notes[s].append(f"多头双周期共振 (单日{fmt_gex_str(d_val)} | 全周{fmt_gex_str(w_val)})")
             else:
-                notes.append(f"🎯 双周期共振强阻墙：单日({fmt_gex_str(d_val)})与全周({fmt_gex_str(w_val)})共同天花板，多单分批止盈区")
+                shield_candidates.append((score * 1.2, s))
+                strike_notes[s].append(f"双周期正GEX联合护盘铁底 (单日{fmt_gex_str(d_val)} | 全周{fmt_gex_str(w_val)})")
 
-        # 2. 双周期负 Gamma 共振 (单日与全周同为强负GEX雷区)
-        elif d_val < 0 and w_val < 0 and ((s in day_meta["top_neg"] and s in week_meta["top_neg"]) or (d_norm > 0.45 and w_norm > 0.45)):
-            icon = "🎯"
-            notes.append(f"🎯 双周期共振空头雷区：单日({fmt_gex_str(d_val)})与全周({fmt_gex_str(w_val)})双重负Gamma磁吸靶心，跌穿加速/急杀尾声博反抽")
+        # 2. 同向负 Gamma 共振评分
+        elif d_val < 0 and w_val < 0 and d_norm > 0.20 and w_norm > 0.20:
+            wall_boost = 1.35 if (s == day_meta["pw"] or s == week_meta["pw"]) else 1.0
+            score = math.sqrt(d_norm * w_norm) * wall_boost
+            neg_res_candidates.append((score, s))
+            strike_notes[s].append(f"空头双周期共振靶心 (单日{fmt_gex_str(d_val)} | 全周{fmt_gex_str(w_val)})")
 
-        # 3. 日黄周紫背离陷阱 (单日正GEX，但全周为显著负GEX)
-        elif d_val > 0 and w_val < 0 and d_norm > 0.18 and w_norm > 0.22:
-            if s >= spot:
-                icon = "⚠️"
-                notes.append(f"⚠️ 日黄周紫诱多墙：单日呈正GEX({fmt_gex_str(d_val)})，但全周被负GEX({fmt_gex_str(w_val)})吞噬，谨防冲高回落假突破")
-            else:
-                # 区分：到底是单日巨量卖Put铁底(如QQQ 650)，还是脆弱薄垫(如SPY 731)
-                if s == day_meta["cw"] or d_norm > 0.75:
-                    icon = "🛡️"
-                    notes.append(f"🛡️ 日内卖Put急杀铁底：单日凝聚巨量正GEX({fmt_gex_str(d_val)})对冲全周负压({fmt_gex_str(w_val)})，日内急跌优先止盈大半空单")
-                else:
-                    icon = "⚠️"
-                    notes.append(f"⚠️ 脆弱多头薄垫：单日虽有薄垫({fmt_gex_str(d_val)})，但全周已翻紫({fmt_gex_str(w_val)})，一旦失守将触发周级别加速下跌")
+        # 3. 日黄周紫背离
+        elif d_val > 0 and w_val < 0:
+            if s < spot and (s == day_meta["cw"] or d_norm > 0.60):
+                # 现价下方单日巨量正Gamma铁底 (如 QQQ 650)
+                shield_candidates.append((d_norm * 1.3, s))
+                strike_notes[s].append(f"🛡️ 日内卖Put急跌铁底：单日巨量正GEX({fmt_gex_str(d_val)})对冲全周负压({fmt_gex_str(w_val)})，空单优先止盈")
+            elif s >= spot and d_norm > 0.20 and w_norm > 0.25:
+                trap_score = math.sqrt(d_norm * w_norm)
+                trap_candidates.append((trap_score, s))
+                strike_notes[s].append(f"⚠️ 日黄周紫诱多墙：单日正GEX({fmt_gex_str(d_val)})被全周负GEX({fmt_gex_str(w_val)})吞噬，防假突破受阻")
+            elif s < spot and d_norm > 0.15 and w_norm > 0.25:
+                strike_notes[s].append(f"⚠️ 脆弱多头薄垫：单日薄垫({fmt_gex_str(d_val)})但全周翻紫({fmt_gex_str(w_val)})，失守易加速")
 
-        # 4. 日紫周黄背离 (单日负GEX，但全周为强正GEX护盘垫)
-        elif d_val < 0 and w_val > 0 and w_norm > 0.30 and s < spot:
-            icon = "💎"
-            notes.append(f"💎 全周机构黄金护垫：单日虽偏空({fmt_gex_str(d_val)})，但全周沉淀厚实正GEX({fmt_gex_str(w_val)})，插针至此易获周线买盘托底")
+        # 4. 日紫周黄背离 (全周机构下方黄金护垫，如 QQQ 648~649)
+        elif d_val <= 0 and w_val > 0 and s < spot and w_norm > 0.30:
+            shield_candidates.append((w_norm, s))
+            strike_notes[s].append(f"🛡️ 全周机构黄金护垫：全周沉淀厚实正GEX({fmt_gex_str(w_val)})，插针至此易获买盘托底")
 
-        # 5. 盘中主力移仓 / 护盘垫蒸发检测
-        if old_d_val > 0 and d_val < 0 and abs(d_val - old_d_val) / day_meta["max_abs"] > 0.25:
-            icon = icon or "🔄"
-            notes.append(f"🔄 盘中支撑蒸发：该行权价从开盘正GEX({fmt_gex_str(old_d_val)})被空头扫货翻紫为({fmt_gex_str(d_val)})")
-        elif abs(d_val - old_d_val) / day_meta["max_abs"] > 0.40:
-            icon = icon or "🔄"
+        # 5. 盘中移仓检测
+        diff_norm = abs(d_val - old_d_val) / day_meta["max_abs"]
+        if old_d_val > 0 and d_val < 0 and diff_norm > 0.30:
+            shift_candidates.append((diff_norm * 1.5, s))
+            strike_notes[s].append(f"🔄 盘中支撑蒸发：从正GEX({fmt_gex_str(old_d_val)})被空头砸穿翻紫({fmt_gex_str(d_val)})")
+        elif diff_norm > 0.45:
+            shift_candidates.append((diff_norm, s))
             dir_str = "主力增仓强化" if abs(d_val) > abs(old_d_val) else "主力平仓撤退"
-            notes.append(f"🔄 盘中移仓异动：{dir_str} ({fmt_gex_str(old_d_val)} ➔ {fmt_gex_str(d_val)})")
+            strike_notes[s].append(f"🔄 盘中移仓异动：{dir_str} ({fmt_gex_str(old_d_val)} ➔ {fmt_gex_str(d_val)})")
 
-        if notes:
-            strike_tags[s] = {"icon": icon, "note": "；".join(notes)}
+    # --- C. 严格唯一图标授勋 (Top-1 Lock) ---
+    # 1) 唯一上方多头共振主靶心 🎯
+    if pos_res_candidates:
+        best_pos_score, best_pos_s = max(pos_res_candidates, key=lambda x: x[0])
+        if best_pos_score >= 0.32:
+            strike_icons[best_pos_s] = "🎯"
+            strike_notes[best_pos_s].insert(0, "🎯【全列唯一多头1号共振主靶心】")
 
-    # 缓慢更新锚定基准 (98% 保留初始锚定 + 2% 跟踪)，确保既能抓移仓又不过度敏感
+    # 2) 唯一空头负Gamma共振主靶心 🎯
+    if neg_res_candidates:
+        best_neg_score, best_neg_s = max(neg_res_candidates, key=lambda x: x[0])
+        if best_neg_score >= 0.32:
+            strike_icons[best_neg_s] = "🎯"
+            strike_notes[best_neg_s].insert(0, "🎯【全列唯一空头1号共振主靶心】")
+
+    # 3) 唯一最强下方护盘铁底 🛡️ (不覆盖已有的 🎯)
+    if shield_candidates:
+        best_sh_score, best_sh_s = max(shield_candidates, key=lambda x: x[0])
+        if best_sh_score >= 0.35 and not strike_icons[best_sh_s]:
+            strike_icons[best_sh_s] = "🛡️"
+
+    # 4) 唯一最显著上方日黄周紫背离墙 ⚠️
+    if trap_candidates:
+        best_tr_score, best_tr_s = max(trap_candidates, key=lambda x: x[0])
+        if best_tr_score >= 0.28 and not strike_icons[best_tr_s]:
+            strike_icons[best_tr_s] = "⚠️"
+
+    # 5) 唯一最剧烈盘中移仓点 🔄
+    if shift_candidates:
+        best_shf_score, best_shf_s = max(shift_candidates, key=lambda x: x[0])
+        if not strike_icons[best_shf_s]:
+            strike_icons[best_shf_s] = "🔄"
+
     for s in ladder_strikes:
         anchor["gex_map"][s] = 0.98 * anchor["gex_map"].get(s, day_map.get(s, 0.0)) + 0.02 * day_map.get(s, 0.0)
 
-    # --- C. 实时生成每列顶部 Tactical HUD 作战指令条 ---
+    # --- D. 生成顶部实时 Tactical HUD 作战指令条 ---
     center_s = round(round(spot / step) * step, 2)
     below_3 = [round(center_s - i * step, 2) for i in (1, 2, 3)]
     vacuum_below = all((day_map.get(s, 0.0) < 0 and week_map.get(s, 0.0) < 0) for s in below_3)
 
     cur_d_gex = day_map.get(center_s, 0.0)
     cur_w_gex = week_map.get(center_s, 0.0)
+    top_neg_target = max(neg_res_candidates, key=lambda x: x[0])[1] if neg_res_candidates else day_meta["pw"]
+    top_pos_target = max(pos_res_candidates, key=lambda x: x[0])[1] if pos_res_candidates else day_meta["cw"]
 
-    # 1. 检测现价是否正在冲击“日黄周紫”诱多伏击位
     if cur_d_gex > 0 and cur_w_gex < 0 and abs(cur_w_gex) / week_meta["max_abs"] > 0.22 and spot >= day_meta["flip"]:
         hud = {
-            "text": f"🟠 触及 {center_s} 日黄周紫背离区(单日+{fmt_gex_str(cur_d_gex)}/全周{fmt_gex_str(cur_w_gex)})，受阻优先伏击Put",
+            "text": f"🟠 触及 {center_s}⚠️ 日黄周紫诱多墙，受阻优先伏击Put看向 {top_neg_target}🎯",
             "color": "#f59e0b"
         }
-        trigger_voice_once(f"{ticker_key}_DIV_TRAP_{center_s}", f"🎯 {ticker_key} 触及 {center_s} 日黄周紫背离压制区，提防冲高回落假突破！")
+        trigger_voice_once(f"{ticker_key}_DIV_TRAP_{center_s}", f"🎯 {ticker_key} 触及 {center_s} 日黄周紫背离压制区，提防假突破！")
 
-    # 2. 检测现价是否到达双周期下方极值决战位 / 卖Put铁底
-    elif abs(spot - day_meta["pw"]) <= step * 0.6 or abs(spot - week_meta["pw"]) <= step * 0.6:
-        target_wall = week_meta["pw"] if abs(spot - week_meta["pw"]) <= step * 0.6 else day_meta["pw"]
+    elif abs(spot - top_neg_target) <= step * 0.6:
         hud = {
-            "text": f"🛡️ 抵达 {target_wall}▼ 空头极值靶心！紧盯盘口止盈Put，勿在地板盲目追空",
+            "text": f"🎯 抵达 {top_neg_target}▼ 唯一空头1号主靶心！注意分批止盈Put，严防反抽",
             "color": "#facc15"
         }
-        trigger_voice_once(f"{ticker_key}_PW_HIT_{target_wall}", f"🎯 {ticker_key} 触及 {target_wall} 负Gamma极值靶心，注意空单分批止盈！")
+        trigger_voice_once(f"{ticker_key}_PW_HIT_{top_neg_target}", f"🎯 {ticker_key} 抵达 {top_neg_target} 唯一空头主靶心，注意止盈！")
 
     elif spot < day_meta["flip"] and cur_d_gex > 0 and (center_s == day_meta["cw"] or cur_d_gex / day_meta["max_abs"] > 0.65):
         hud = {
-            "text": f"🛡️ 触及 {center_s}👑 日内巨量正GEX护盘铁底({fmt_gex_str(cur_d_gex)})！空单果断止盈博反抽",
+            "text": f"🛡️ 触及 {center_s}👑 日内巨量正GEX护盘铁底({fmt_gex_str(cur_d_gex)})！果断止盈空单",
             "color": "#facc15"
         }
-        trigger_voice_once(f"{ticker_key}_IRON_BOT_{center_s}", f"🛡️ {ticker_key} 触及 {center_s} 日内主力正Gamma铁底，建议空单止盈！")
+        trigger_voice_once(f"{ticker_key}_IRON_BOT_{center_s}", f"🛡️ {ticker_key} 触及 {center_s} 日内正Gamma铁底，建议空单止盈！")
 
-    # 3. 检测现价下方是否跌入双周期连续负Gamma真空滑梯
     elif spot < day_meta["flip"] and spot < week_meta["flip"] and vacuum_below:
-        next_support = next((s for s in ladder_strikes if s < spot and (day_map.get(s, 0.0) > 0 or week_map.get(s, 0.0) > 0)), day_meta["pw"])
         hud = {
-            "text": f"🟣 双周期翻转轴({day_meta['flip']}◆)下方真空滑梯！顺势看空直指 {next_support}",
+            "text": f"🟣 翻转轴({day_meta['flip']}◆)下方负Gamma真空滑梯！唯一主靶心直指 {top_neg_target}🎯",
             "color": "#c084fc"
         }
-        trigger_voice_once(f"{ticker_key}_VACUUM_{center_s}", f"⚠️ {ticker_key} 处于双周期负Gamma真空滑梯，下方目标直指 {next_support}！")
 
-    # 4. 检测现价是否同时站稳单日与全周双翻转轴之上（多头顺风局）
     elif spot >= day_meta["flip"] and spot >= week_meta["flip"]:
         hud = {
-            "text": f"🟢 站稳日/周双翻转轴({day_meta['flip']}◆/{week_meta['flip']}◆)之上，多头顺风看向 {day_meta['cw']}▲",
+            "text": f"🟢 站稳双翻转轴({day_meta['flip']}◆)之上，多头1号主靶心看向 {top_pos_target}🎯",
             "color": "#10b981"
         }
 
-    # 5. 默认震荡拉锯状态
     else:
         hud = {
-            "text": f"⚪ 多空拉锯：上方翻转压制 {max(day_meta['flip'], week_meta['flip'])}◆ | 下方空头靶心 {day_meta['pw']}▼",
+            "text": f"⚪ 震荡拉锯：上方翻转轴 {max(day_meta['flip'], week_meta['flip'])}◆ | 下方唯一主靶心 {top_neg_target}🎯",
             "color": "#94a3b8"
         }
 
+    strike_tags = {
+        s: {"icon": strike_icons[s], "note": "；".join(strike_notes[s])}
+        for s in ladder_strikes
+    }
     return strike_tags, hud, dynamic_alerts
 
 
@@ -557,7 +591,6 @@ def compute_ticker_gex(ticker_key, use_ema=True):
     hours_left = max(1.0, (16 - est_now.hour) + (15 - est_now.minute) / 60.0) if est_now.hour < 16 else 1.5
     t_0dte = max(hours_left / (252.0 * 6.5), 1.0 / (252.0 * 24.0))
 
-    # 同时初始化【单日桶】与【全周OPEX桶】，一次遍历完成双周期计算
     day_buckets = {}
     week_buckets = {}
     vol_weight = 1.35 if NOISE_REDUCTION else 0.75
@@ -585,7 +618,6 @@ def compute_ticker_gex(ticker_key, use_ema=True):
         dist_pct = abs(strike - spot) / spot
         flow_boost = 1.85 if dist_pct <= 0.018 else 1.15
 
-        # --- 1) 填入单日桶 (Day Profile) ---
         if yymmdd == target_d:
             if not LIVE_FLOW_MODE:
                 d_gex = base_unit_gex * (oi + vol * vol_weight) * static_sign
@@ -609,7 +641,6 @@ def compute_ticker_gex(ticker_key, use_ema=True):
                 bd["put_oi"] += int(oi)
                 bd["put_vol"] += int(vol)
 
-        # --- 2) 填入本周OPEX桶 (Week Profile) ---
         if yymmdd in week_slice_set:
             w_factor = 1.0 if (yymmdd == target_d or yymmdd == last_week_d) else 0.85
             if not LIVE_FLOW_MODE:
@@ -637,7 +668,6 @@ def compute_ticker_gex(ticker_key, use_ema=True):
     center_strike = round(round(spot / step) * step, 2)
     ladder_strikes = [round(center_strike + i * step, 2) for i in range(12, -13, -1)]
 
-    # 对单日与全周分别做 EMA 阻尼平滑
     day_gex_map = {}
     week_gex_map = {}
     for s in ladder_strikes:
@@ -659,16 +689,13 @@ def compute_ticker_gex(ticker_key, use_ema=True):
             week_gex_map[s] = raw_w
         EMA_GEX_CACHE[ema_w_key] = week_gex_map[s]
 
-    # 提取单日与全周各自的节点特征
     day_meta = extract_profile_nodes(ladder_strikes, day_gex_map, spot, step)
     week_meta = extract_profile_nodes(ladder_strikes, week_gex_map, spot, step)
 
-    # 运行全动态双周期共振 & 盘中移仓分析引擎
     strike_tags, hud, dynamic_alerts = analyze_dynamic_resonance_and_shifts(
         ticker_key, target_d, spot, step, ladder_strikes, day_gex_map, week_gex_map, day_meta, week_meta
     )
 
-    # 根据当前前端选择的视图 (单日 or 本周) 组装渲染行，但保留双周期透视数据
     active_buckets = week_buckets if WEEKLY_MODE else day_buckets
     active_map = week_gex_map if WEEKLY_MODE else day_gex_map
     active_meta = week_meta if WEEKLY_MODE else day_meta
@@ -832,7 +859,7 @@ HTML_TEMPLATE = """
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>GEX 实时量化指挥舱 (动态双周期共振算法版)</title>
+<title>GEX 实时量化指挥舱 (Top-1 唯一主靶心版)</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -1011,8 +1038,8 @@ HTML_TEMPLATE = """
     border: 1px solid #38bdf8;
   }
   .tac-dot {
-    font-size: 11px;
-    opacity: 0.95;
+    font-size: 12px;
+    filter: drop-shadow(0 0 3px rgba(0,0,0,0.8));
   }
   .col-footer {
     display: flex;
@@ -1044,7 +1071,7 @@ HTML_TEMPLATE = """
     z-index: 9999;
     pointer-events: none;
     box-shadow: 0 8px 20px rgba(0,0,0,0.6);
-    max-width: 300px;
+    max-width: 310px;
   }
   .alert-banner {
     display: none;
@@ -1084,7 +1111,7 @@ HTML_TEMPLATE = """
   <span style="cursor:pointer; padding:0 6px;" onclick="document.getElementById('alertBox').style.display='none'">✖</span>
 </div>
 <div id="grid" class="grid-container">
-  <div class="loading-box">⚡ 正在启动双周期动态共振与盘中移仓雷达 (约 1~2 秒)...</div>
+  <div class="loading-box">⚡ 正在锁定各列 Top-1 唯一双周期主靶心 (约 1~2 秒)...</div>
 </div>
 <div id="tooltip"></div>
 
@@ -1169,7 +1196,7 @@ function showTooltip(e, ticker, row) {
     ${tacHtml}
   `;
   tt.style.display = "block";
-  tt.style.left = Math.min(e.clientX + 14, window.innerWidth - 310) + "px";
+  tt.style.left = Math.min(e.clientX + 14, window.innerWidth - 320) + "px";
   tt.style.top = Math.min(e.clientY + 14, window.innerHeight - 180) + "px";
 }
 
@@ -1318,7 +1345,7 @@ if __name__ == "__main__":
     t = threading.Thread(target=background_sync_worker, daemon=True)
     t.start()
     print("=========================================================")
-    print("🚀 XSP/SPX GEX 指挥中心 (全动态双周期共振 + 盘中移仓追踪算法版) 已启动")
+    print("🚀 XSP/SPX GEX 指挥中心 (Top-1 唯一主靶心收敛版) 已启动")
     print("👉 请在浏览器打开: http://127.0.0.1:5000")
     print("=========================================================")
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
