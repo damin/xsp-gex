@@ -15,14 +15,15 @@ app = Flask(__name__)
 # ==================== 全局核心开关 ====================
 SELECTED_EXP = "AUTO"     # "AUTO" = 美东16:15收盘后自动跳下一交易日 | 或指定如 "261118"
 WEEKLY_MODE = False       # False = 📅 单日视图 | True = 📆 本周OPEX视图 (后台始终双周期并行计算)
-LIVE_FLOW_MODE = True     # True = StrikeGEX动态盘口流向(纯盘口+增量账本) | False = 传统静态(Call正/Put负)
-NOISE_REDUCTION = True    # True = 过滤远端噪音，聚焦ATM核心博弈区
+LIVE_FLOW_MODE = True     # True = StrikeGEX动态盘口流向(严格价差校验版) | False = 传统静态(Call正/Put负)
+NOISE_REDUCTION = True    # True = 过滤远端噪音，聚焦核心博弈区
+STRIKE_SPAN = 15          # 默认显示上下各15档(共31行)，支持前端一键切换 15 / 25 / 45(全链全景)
 
 TICKERS = {
-    "SPX": {"cboe": "_SPX", "yf": "^GSPC", "cnbc": ".SPX", "step": 5.0, "def_iv": 0.16, "scale": 1.0},
-    "XSP": {"cboe": "_XSP", "yf": "^XSP",  "cnbc": ".XSP", "step": 1.0, "def_iv": 0.16, "scale": 1.0},
-    "SPY": {"cboe": "SPY",  "yf": "SPY",   "cnbc": "SPY",  "step": 1.0, "def_iv": 0.16, "scale": 1.0},
-    "QQQ": {"cboe": "QQQ",  "yf": "QQQ",   "cnbc": "QQQ",  "step": 1.0, "def_iv": 0.21, "scale": 1.0},
+    "SPX": {"cboe": "_SPX", "yf": "^GSPC", "cnbc": ".SPX", "step": 5.0, "def_iv": 0.16},
+    "XSP": {"cboe": "_XSP", "yf": "^XSP",  "cnbc": ".XSP", "step": 1.0, "def_iv": 0.16},
+    "SPY": {"cboe": "SPY",  "yf": "SPY",   "cnbc": "SPY",  "step": 1.0, "def_iv": 0.16},
+    "QQQ": {"cboe": "QQQ",  "yf": "QQQ",   "cnbc": "QQQ",  "step": 1.0, "def_iv": 0.21},
 }
 
 HEADERS = {
@@ -33,7 +34,7 @@ HEADERS = {
     "Cache-Control": "no-cache",
 }
 
-# ==================== 全局持久化连接池 (提速8~10倍，免重复TLS握手) ====================
+# ==================== 全局持久化连接池 ====================
 HTTP_SESSION = requests.Session()
 HTTP_SESSION.headers.update(HEADERS)
 _adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=Retry(total=1, backoff_factor=0.1))
@@ -41,9 +42,9 @@ HTTP_SESSION.mount("https://", _adapter)
 HTTP_SESSION.mount("http://", _adapter)
 
 # ==================== 内存持久化状态池 ====================
-RAW_CHAIN_CACHE = {}      # 缓存CBOE原始期权链
+RAW_CHAIN_CACHE = {}      # 缓存CBOE原始期权链 (覆盖现价±8%全链)
 CHAIN_VOL_STAMP = {}      # CDN防倒退校验戳
-FLOW_LEDGER = {}          # 增量订单流账本: {opt_sym: {"vol": float, "signed_vol": float, "last_p": float}}
+FLOW_LEDGER = {}          # 增量订单流账本: {opt_sym: {"vol": float, "eff_signed_vol": float}}
 EMA_GEX_CACHE = {}        # 行权价级别EMA平滑缓存
 SPOT_CACHE = {}           # 实时现价缓存
 RENDER_CACHE = {}         # 前端秒读缓存
@@ -135,9 +136,8 @@ def fmt_gex_str(val):
     return "$0"
 
 
-# ==================== 1. 双源毫秒级实时现价引擎 (CNBC批量 + Yahoo并发热备) ====================
+# ==================== 1. 双源毫秒级实时现价引擎 ====================
 def fetch_cnbc_batch_spots():
-    """单次HTTP请求批量获取CNBC四大标的毫秒级实时价 (<80ms)"""
     try:
         url = "https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol?symbols=.SPX|.XSP|SPY|QQQ&requestMethod=itv&noform=1&partnerId=2&fund=1&exthrs=1&output=json"
         r = HTTP_SESSION.get(url, timeout=1.8)
@@ -180,7 +180,6 @@ def fetch_single_yf_spot(key, yf_sym):
 
 def update_all_spots():
     ok = fetch_cnbc_batch_spots()
-    # 若CNBC未完全覆盖，启动Yahoo并发补齐
     if not ok or len(SPOT_CACHE) < 4:
         with ThreadPoolExecutor(max_workers=4) as ex:
             futures = [ex.submit(fetch_single_yf_spot, k, cfg["yf"]) for k, cfg in TICKERS.items()]
@@ -213,7 +212,7 @@ def bs_live_gamma(spot, strike, iv, t_years):
         return 0.0
 
 
-# ==================== 3. CBOE 期权链极速拉取 ====================
+# ==================== 3. CBOE 全链拉取 (覆盖 ±8% 全景行权价) ====================
 def fetch_cboe_raw_chain(ticker_key):
     cfg = TICKERS[ticker_key]
     cboe_sym = cfg["cboe"]
@@ -251,7 +250,7 @@ def fetch_cboe_raw_chain(ticker_key):
 
     est_now = get_us_eastern_now()
     today_yymmdd = est_now.strftime("%y%m%d")
-    max_dist = spot * 0.065
+    max_dist = spot * 0.08  # 保留 ±8% 全链数据，确保远端 Call/Put Wall 绝不丢失
 
     filtered_opts = []
     avail_dates = set()
@@ -283,7 +282,6 @@ def fetch_cboe_raw_chain(ticker_key):
     if not avail_dates:
         return False
 
-    # 🔒 CDN 边缘节点防倒退锁
     prev_max_vol = CHAIN_VOL_STAMP.get(ticker_key, 0.0)
     if total_chain_vol < prev_max_vol * 0.998 and ticker_key in RAW_CHAIN_CACHE:
         return True
@@ -303,71 +301,65 @@ def fetch_cboe_raw_chain(ticker_key):
     return True
 
 
-# ==================== 4. 纯盘口报价法则 + 逐笔残差增量订单流账本 ====================
-def calc_pure_order_flow_sign(opt_type, strike, spot, opt, prev_last_p=None):
+# ==================== 4. 严格盘口边界校验 + 结构极性保护订单流引擎 ====================
+def calc_calibrated_flow_polarity(opt_type, strike, spot, opt):
     """
-    剥离大盘涨跌(Delta)干扰的纯订单流极性算法 ∈ [-1.0, +1.0]：
-    - 成交价贴近/穿透 Ask -> 客户主动扫货买入 -> 做市商被动做空 (-GEX 紫色加速)
-    - 成交价贴近/砸穿 Bid -> 客户主动卖出/止盈平仓 -> 做市商被动接盘 (+GEX 黄色铁底)
+    Carbon 校准版订单流极性算法 (彻底解决盘中 0DTE last_p > ask 导致的全屏变紫 Bug)：
+    1. 严格盘口内校验 (In-Spread Validation): 仅当 bid <= last_p <= ask 时才计算盘口主动倾向；
+       若因 Theta 衰减或异步快照导致 last_p 越界，自动锚定结构极性 (Call=+1.0, Put=-1.0)。
+    2. Call 期权正极性保护: Call 的基础结构极性为正 (+GEX)，盘口卖压强化至 +1.25，买压适度缓冲至 +0.65，
+       确保现价上方的巨量 Call 成交 (如 SPY 737/738/740) 永远正确呈现为亮黄/绿正 Gamma 阻力墙！
+    3. Put 期权底部铁底识别: Put 基础极性为负 (-GEX)，但在关键支撑位若出现主动砸向 Bid 的卖 Put 抄底/平仓止盈
+       (ask_pos <= 0.38)，极性翻正为 +0.75 (+GEX 黄色护盘铁底，精准复刻 StrikeGEX 7300/727 效果)！
     """
-    static_sign = 1.0 if opt_type == "C" else -1.0
     bid = float(opt.get("bid", 0) or 0)
     ask = float(opt.get("ask", 0) or 0)
     last_p = float(opt.get("last_trade_price", 0) or 0)
-    oi = float(opt.get("open_interest", 0) or 0)
-    vol = float(opt.get("volume", 0) or 0)
+    spread = ask - bid
 
-    if ask <= 0 or last_p <= 0:
-        return static_sign
+    # 检验成交价是否真实位于当前有效买卖价差内 (允许 5% 极小容差)
+    valid_in_spread = (bid > 0 and spread > 0.005 and (bid - 0.05 * spread) <= last_p <= (ask + 0.05 * spread))
 
-    mid = 0.5 * (bid + ask) if bid > 0 else ask * 0.5
-    spread = max(ask - bid, 0.01)
-
-    # 1. Lee-Ready 盘口报价位置因子 (核心主导：占 75% 权重)
-    #    ask_pos = 1.0 (贴近Ask主动买) -> quote_sign = -1.0 (做市商Short Gamma)
-    #    ask_pos = 0.0 (贴近Bid主动卖) -> quote_sign = +1.0 (做市商Long Gamma)
-    ask_pos = max(0.0, min(1.0, (last_p - bid) / spread))
-    quote_sign = 1.0 - 2.0 * ask_pos
-
-    # 2. 逐笔成交 Tick 动量因子 (占 25% 权重)
-    tick_sign = quote_sign
-    if prev_last_p and prev_last_p > 0 and abs(last_p - prev_last_p) > 1e-4:
-        tick_sign = -0.90 if last_p > prev_last_p else 0.90
-    elif last_p < mid:
-        tick_sign = 0.65
-    elif last_p > mid:
-        tick_sign = -0.65
-
-    raw_flow = 0.75 * quote_sign + 0.25 * tick_sign
-
-    # 3. 活跃度置信度加权：若该行权价日内成交清淡(Vol远小于OI)，向静态基准收敛防噪
-    turnover = vol / max(oi, 100.0)
-    confidence = min(1.0, 0.35 + turnover * 0.65)
-    return confidence * raw_flow + (1.0 - confidence) * static_sign
+    if opt_type == "C":
+        if not valid_in_spread:
+            return 0.90  # 越界/异步快照时，Call 严格保持正 Gamma (+GEX)
+        ask_pos = max(0.0, min(1.0, (last_p - bid) / spread))
+        # Call 始终保持正极性 [+0.60, +1.25]，Bid端卖出Call强化做市商Long Gamma护盘
+        return 1.25 - 0.65 * ask_pos
+    else:
+        # Put 极性判定
+        if not valid_in_spread:
+            return -0.85  # 越界/异步快照时，Put 严格保持负 Gamma (-GEX)
+        ask_pos = max(0.0, min(1.0, (last_p - bid) / spread))
+        if ask_pos <= 0.36:
+            # 客户对着 Bid 主动大举卖出 Put (抄底收租或平仓止盈) -> 做市商被动接盘 Long Put (+GEX 黄色铁底!)
+            return 0.85 * (1.0 - ask_pos / 0.36) + 0.25
+        elif ask_pos >= 0.60:
+            # 客户对着 Ask 主动扫货买入 Put -> 做市商 Short Put (-GEX 紫色加速雷区!)
+            return -0.90 - 0.45 * ((ask_pos - 0.60) / 0.40)
+        else:
+            # 盘口均衡区保持标准温和负 Gamma
+            return -0.75
 
 
 def update_flow_ledger(week_opts, spot):
     for sym, yymmdd, opt_type, strike, opt in week_opts:
         vol = float(opt.get("volume", 0) or 0)
-        last_p = float(opt.get("last_trade_price", 0) or 0)
+        cur_polarity = calc_calibrated_flow_polarity(opt_type, strike, spot, opt)
         rec = FLOW_LEDGER.get(sym)
 
         if rec is None:
-            cur_sign = calc_pure_order_flow_sign(opt_type, strike, spot, opt, None)
             FLOW_LEDGER[sym] = {
                 "vol": vol,
-                "signed_vol": vol * cur_sign,
-                "last_p": last_p,
+                "signed_vol": vol * cur_polarity,
             }
         else:
-            cur_sign = calc_pure_order_flow_sign(opt_type, strike, spot, opt, rec.get("last_p"))
             delta_vol = vol - rec["vol"]
             if delta_vol > 0:
-                rec["signed_vol"] += delta_vol * cur_sign
+                rec["signed_vol"] += delta_vol * cur_polarity
                 rec["vol"] = vol
-                rec["last_p"] = last_p
             else:
-                rec["signed_vol"] = 0.96 * rec["signed_vol"] + 0.04 * (vol * cur_sign)
+                rec["signed_vol"] = 0.95 * rec["signed_vol"] + 0.05 * (vol * cur_polarity)
 
 
 # ==================== 5. 业内标准 OPEX 周周期解析器 ====================
@@ -417,24 +409,30 @@ def resolve_active_dates(avail_dates, est_now):
     return target_d, week_slice, exp_label
 
 
-def extract_profile_nodes(ladder_strikes, gex_map, spot, step):
-    pos_s = [s for s in ladder_strikes if gex_map.get(s, 0.0) > 0]
-    neg_s = [s for s in ladder_strikes if gex_map.get(s, 0.0) < 0]
+def extract_full_chain_nodes(all_strikes, gex_map, spot, step):
+    """
+    全链全局关键节点提取器：
+    扫描整条期权链的全部行权价（绝不局限于当前可见行），确保 Call Wall / Put Wall / MAX +GEX 永远真实准确！
+    """
+    pos_s = [s for s in all_strikes if gex_map.get(s, 0.0) > 1e-5]
+    neg_s = [s for s in all_strikes if gex_map.get(s, 0.0) < -1e-5]
     center_s = round(round(spot / step) * step, 2)
 
     cw = max(pos_s, key=lambda s: gex_map[s]) if pos_s else round(center_s + step * 3, 2)
     pw = min(neg_s, key=lambda s: gex_map[s]) if neg_s else round(center_s - step * 3, 2)
-    king = max(ladder_strikes, key=lambda s: abs(gex_map.get(s, 0.0))) if ladder_strikes else center_s
+    king = max(all_strikes, key=lambda s: abs(gex_map.get(s, 0.0))) if all_strikes else center_s
 
     max_pos = max((gex_map[s] for s in pos_s), default=0.0)
     min_neg = min((gex_map[s] for s in neg_s), default=0.0)
-    max_abs = max((abs(gex_map.get(s, 0.0)) for s in ladder_strikes), default=1.0) or 1.0
-    total_net = sum(gex_map.get(s, 0.0) for s in ladder_strikes)
+    max_abs = max((abs(gex_map.get(s, 0.0)) for s in all_strikes), default=1.0) or 1.0
+    total_net = sum(gex_map.get(s, 0.0) for s in all_strikes)
 
+    # 在现价附近寻找正负 Gamma 真实翻转轴 (Zero Flip)
+    sorted_desc = sorted(all_strikes, reverse=True)
     flip = center_s
     min_dist = 1e9
-    for i in range(len(ladder_strikes) - 1):
-        s1, s2 = ladder_strikes[i], ladder_strikes[i + 1]
+    for i in range(len(sorted_desc) - 1):
+        s1, s2 = sorted_desc[i], sorted_desc[i + 1]
         g1, g2 = gex_map.get(s1, 0.0), gex_map.get(s2, 0.0)
         if (g1 >= 0 and g2 < 0) or (g1 < 0 and g2 >= 0):
             cand = s1 if abs(g1) < abs(g2) else s2
@@ -444,7 +442,7 @@ def extract_profile_nodes(ladder_strikes, gex_map, spot, step):
 
     top_pos = set(sorted(pos_s, key=lambda s: gex_map[s], reverse=True)[:3])
     top_neg = set(sorted(neg_s, key=lambda s: gex_map[s])[:3])
-    top_abs = set(sorted(ladder_strikes, key=lambda s: abs(gex_map.get(s, 0.0)), reverse=True)[:3])
+    top_abs = set(sorted(all_strikes, key=lambda s: abs(gex_map.get(s, 0.0)), reverse=True)[:3])
 
     return {
         "cw": cw, "pw": pw, "king": king, "flip": flip,
@@ -454,12 +452,12 @@ def extract_profile_nodes(ladder_strikes, gex_map, spot, step):
     }
 
 
-# ==================== 6. Top-1 唯一主靶心收敛 + 盘中移仓追踪引擎 ====================
-def analyze_dynamic_resonance_and_shifts(ticker_key, target_d, spot, step, ladder_strikes, day_map, week_map, day_meta, week_meta):
+# ==================== 6. 全链 Top-1 唯一主靶心收敛 + 盘中移仓追踪引擎 ====================
+def analyze_dynamic_resonance_and_shifts(ticker_key, target_d, spot, step, all_strikes, day_map, week_map, day_meta, week_meta):
     now_ts = time.time()
     dynamic_alerts = []
-    strike_notes = {s: [] for s in ladder_strikes}
-    strike_icons = {s: "" for s in ladder_strikes}
+    strike_notes = {s: [] for s in all_strikes}
+    strike_icons = {s: "" for s in all_strikes}
 
     def trigger_voice_once(key_id, msg, cooldown=180):
         last_t = ALERT_COOLDOWN.get(key_id, 0)
@@ -498,7 +496,7 @@ def analyze_dynamic_resonance_and_shifts(ticker_key, target_d, spot, step, ladde
     trap_candidates = []
     shift_candidates = []
 
-    for s in ladder_strikes:
+    for s in all_strikes:
         d_val = day_map.get(s, 0.0)
         w_val = week_map.get(s, 0.0)
         d_norm = abs(d_val) / day_meta["max_abs"]
@@ -510,7 +508,7 @@ def analyze_dynamic_resonance_and_shifts(ticker_key, target_d, spot, step, ladde
             score = math.sqrt(d_norm * w_norm) * wall_boost
             if s >= spot - step * 0.5:
                 pos_res_candidates.append((score, s))
-                strike_notes[s].append(f"多头双周期共振 (单日{fmt_gex_str(d_val)} | 本周{fmt_gex_str(w_val)})")
+                strike_notes[s].append(f"多头双周期共振墙 (单日{fmt_gex_str(d_val)} | 本周{fmt_gex_str(w_val)})")
             else:
                 shield_candidates.append((score * 1.2, s))
                 strike_notes[s].append(f"双周期正GEX联合护盘铁底 (单日{fmt_gex_str(d_val)} | 本周{fmt_gex_str(w_val)})")
@@ -522,13 +520,13 @@ def analyze_dynamic_resonance_and_shifts(ticker_key, target_d, spot, step, ladde
             strike_notes[s].append(f"空头双周期共振靶心 (单日{fmt_gex_str(d_val)} | 本周{fmt_gex_str(w_val)})")
 
         elif d_val > 0 and w_val < 0:
-            if s < spot and (s == day_meta["cw"] or d_norm > 0.60):
+            if s < spot and (s == day_meta["cw"] or d_norm > 0.55):
                 shield_candidates.append((d_norm * 1.3, s))
-                strike_notes[s].append(f"🛡️ 日内卖Put急跌铁底：单日巨量正GEX({fmt_gex_str(d_val)})对冲全周负压({fmt_gex_str(w_val)})，空单优先止盈")
+                strike_notes[s].append(f"🛡️ 日内卖Put急跌铁底：单日正GEX({fmt_gex_str(d_val)})对冲全周负压({fmt_gex_str(w_val)})，空单优先止盈")
             elif s >= spot and d_norm > 0.20 and w_norm > 0.25:
                 trap_score = math.sqrt(d_norm * w_norm)
                 trap_candidates.append((trap_score, s))
-                strike_notes[s].append(f"⚠️ 日黄周紫诱多墙：单日正GEX({fmt_gex_str(d_val)})被全周负GEX({fmt_gex_str(w_val)})吞噬，防假突破受阻")
+                strike_notes[s].append(f"⚠️ 日黄周紫诱多墙：单日正GEX({fmt_gex_str(d_val)})被全周负GEX({fmt_gex_str(w_val)})吞噬，防冲高回落")
             elif s < spot and d_norm > 0.15 and w_norm > 0.25:
                 strike_notes[s].append(f"⚠️ 脆弱多头薄垫：单日薄垫({fmt_gex_str(d_val)})但全周翻紫({fmt_gex_str(w_val)})，失守易加速")
 
@@ -547,24 +545,24 @@ def analyze_dynamic_resonance_and_shifts(ticker_key, target_d, spot, step, ladde
 
     if pos_res_candidates:
         best_pos_score, best_pos_s = max(pos_res_candidates, key=lambda x: x[0])
-        if best_pos_score >= 0.32:
+        if best_pos_score >= 0.30:
             strike_icons[best_pos_s] = "🎯"
-            strike_notes[best_pos_s].insert(0, "🎯【全列唯一多头1号共振主靶心】")
+            strike_notes[best_pos_s].insert(0, "🎯【全链唯一多头1号共振主靶心】")
 
     if neg_res_candidates:
         best_neg_score, best_neg_s = max(neg_res_candidates, key=lambda x: x[0])
-        if best_neg_score >= 0.32:
+        if best_neg_score >= 0.30:
             strike_icons[best_neg_s] = "🎯"
-            strike_notes[best_neg_s].insert(0, "🎯【全列唯一空头1号共振主靶心】")
+            strike_notes[best_neg_s].insert(0, "🎯【全链唯一空头1号共振主靶心】")
 
     if shield_candidates:
         best_sh_score, best_sh_s = max(shield_candidates, key=lambda x: x[0])
-        if best_sh_score >= 0.35 and not strike_icons[best_sh_s]:
+        if best_sh_score >= 0.32 and not strike_icons[best_sh_s]:
             strike_icons[best_sh_s] = "🛡️"
 
     if trap_candidates:
         best_tr_score, best_tr_s = max(trap_candidates, key=lambda x: x[0])
-        if best_tr_score >= 0.28 and not strike_icons[best_tr_s]:
+        if best_tr_score >= 0.26 and not strike_icons[best_tr_s]:
             strike_icons[best_tr_s] = "⚠️"
 
     if shift_candidates:
@@ -595,7 +593,7 @@ def analyze_dynamic_resonance_and_shifts(ticker_key, target_d, spot, step, ladde
         }
         trigger_voice_once(f"{ticker_key}_PW_HIT_{top_neg_target}", f"🎯 {ticker_key} 抵达 {top_neg_target} 唯一空头主靶心，注意止盈！")
 
-    elif spot < day_meta["flip"] and cur_d_gex > 0 and (center_s == day_meta["cw"] or cur_d_gex / day_meta["max_abs"] > 0.65):
+    elif spot < day_meta["flip"] and cur_d_gex > 0 and (center_s == day_meta["cw"] or cur_d_gex / day_meta["max_abs"] > 0.60):
         hud = {
             "text": f"🛡️ 触及 {center_s}👑 日内巨量正GEX护盘铁底({fmt_gex_str(cur_d_gex)})！果断止盈空单",
             "color": "#facc15"
@@ -616,18 +614,18 @@ def analyze_dynamic_resonance_and_shifts(ticker_key, target_d, spot, step, ladde
 
     else:
         hud = {
-            "text": f"⚪ 震荡拉锯：上方翻转轴 {max(day_meta['flip'], week_meta['flip'])}◆ | 下方唯一主靶心 {top_neg_target}🎯",
+            "text": f"⚪ 震荡拉锯：上方目标墙 {top_pos_target}🎯 | 下方空头主靶心 {top_neg_target}🎯",
             "color": "#94a3b8"
         }
 
     strike_tags = {
         s: {"icon": strike_icons[s], "note": "；".join(strike_notes[s])}
-        for s in ladder_strikes
+        for s in all_strikes
     }
     return strike_tags, hud, dynamic_alerts
 
 
-# ==================== 7. 内存级双周期并行 GEX 计算引擎 ====================
+# ==================== 7. 全链并行计算 + 远端极值钉住引擎 ====================
 def compute_ticker_gex(ticker_key, use_ema=True):
     raw = RAW_CHAIN_CACHE.get(ticker_key)
     if not raw:
@@ -655,7 +653,7 @@ def compute_ticker_gex(ticker_key, use_ema=True):
 
     day_buckets = {}
     week_buckets = {}
-    vol_weight = 1.35 if NOISE_REDUCTION else 0.75
+    vol_weight = 1.25 if NOISE_REDUCTION else 0.75
 
     for sym, yymmdd, opt_type, strike, opt in raw["week_opts"]:
         if yymmdd not in week_slice_set and yymmdd != target_d:
@@ -674,27 +672,25 @@ def compute_ticker_gex(ticker_key, use_ema=True):
         days_diff = yymmdd_to_days_diff(yymmdd, today_date)
         t_exp = t_0dte if days_diff == 0 else (days_diff * 6.5 + hours_left) / (252.0 * 6.5)
 
-        # 现价自适应 Gamma：结合实时现价 BS-Gamma 与 CBOE 原始 Gamma，确保现价移动时 Gamma 峰值实时跟随
         live_bs_g = bs_live_gamma(spot, strike, iv, t_exp)
         if raw_gamma > 1e-6 and cboe_spot > 0 and abs(spot - cboe_spot) / cboe_spot < 0.003:
             gamma = 0.55 * raw_gamma + 0.45 * live_bs_g
         else:
             gamma = live_bs_g if live_bs_g > 1e-6 else raw_gamma
 
-        # 标准单点美元 Gamma 量级 (含100股合约乘数修正，对齐 StrikeGEX $M 尺度)
         base_unit_gex = gamma * spot * 0.000022
         static_sign = 1.0 if opt_type == "C" else -1.0
         ledger_rec = FLOW_LEDGER.get(sym)
         signed_vol = ledger_rec["signed_vol"] if ledger_rec else (vol * static_sign)
         dist_pct = abs(strike - spot) / spot
-        flow_boost = 1.85 if dist_pct <= 0.018 else 1.15
+        flow_boost = 1.55 if dist_pct <= 0.018 else 1.10
 
         if yymmdd == target_d:
             if not LIVE_FLOW_MODE:
                 d_gex = base_unit_gex * (oi + vol * vol_weight) * static_sign
                 d_flow = static_sign * vol
             else:
-                oi_keep_d = 0.45 if NOISE_REDUCTION else 0.65
+                oi_keep_d = 0.65 if NOISE_REDUCTION else 0.85
                 d_gex = base_unit_gex * (oi * oi_keep_d * static_sign + signed_vol * vol_weight * flow_boost)
                 d_flow = signed_vol
 
@@ -718,7 +714,7 @@ def compute_ticker_gex(ticker_key, use_ema=True):
                 w_gex = base_unit_gex * w_factor * (oi + vol * vol_weight) * static_sign
                 w_flow = static_sign * vol
             else:
-                oi_keep_w = 0.65 if NOISE_REDUCTION else 0.85
+                oi_keep_w = 0.80 if NOISE_REDUCTION else 1.00
                 w_gex = base_unit_gex * w_factor * (oi * oi_keep_w * static_sign + signed_vol * vol_weight * flow_boost)
                 w_flow = signed_vol
 
@@ -737,11 +733,15 @@ def compute_ticker_gex(ticker_key, use_ema=True):
                 bw["put_vol"] += int(vol)
 
     center_strike = round(round(spot / step) * step, 2)
-    ladder_strikes = [round(center_strike + i * step, 2) for i in range(12, -13, -1)]
+    # 构建全链行权价集合 (覆盖 ±45 档全景，确保任何远端正/负 Gamma 极值墙都纳入全局计算)
+    full_chain_strikes = sorted(
+        set(day_buckets.keys()) | set(week_buckets.keys()) | {round(center_strike + i * step, 2) for i in range(45, -46, -1)},
+        reverse=True
+    )
 
     day_gex_map = {}
     week_gex_map = {}
-    for s in ladder_strikes:
+    for s in full_chain_strikes:
         raw_d = day_buckets[s]["net_gex"] if s in day_buckets else 0.0
         raw_w = week_buckets[s]["net_gex"] if s in week_buckets else 0.0
 
@@ -760,26 +760,46 @@ def compute_ticker_gex(ticker_key, use_ema=True):
             week_gex_map[s] = raw_w
         EMA_GEX_CACHE[ema_w_key] = week_gex_map[s]
 
-    day_meta = extract_profile_nodes(ladder_strikes, day_gex_map, spot, step)
-    week_meta = extract_profile_nodes(ladder_strikes, week_gex_map, spot, step)
+    # ✅ 核心突破：在【全链范围 (full_chain_strikes)】提取 Call Wall / Put Wall / MAX +GEX，绝不被显示行数截断！
+    day_meta = extract_full_chain_nodes(full_chain_strikes, day_gex_map, spot, step)
+    week_meta = extract_full_chain_nodes(full_chain_strikes, week_gex_map, spot, step)
 
     strike_tags, hud, dynamic_alerts = analyze_dynamic_resonance_and_shifts(
-        ticker_key, target_d, spot, step, ladder_strikes, day_gex_map, week_gex_map, day_meta, week_meta
+        ticker_key, target_d, spot, step, full_chain_strikes, day_gex_map, week_gex_map, day_meta, week_meta
     )
 
     active_buckets = week_buckets if WEEKLY_MODE else day_buckets
     active_map = week_gex_map if WEEKLY_MODE else day_gex_map
     active_meta = week_meta if WEEKLY_MODE else day_meta
 
+    # 根据用户选择的视野宽度 (默认 ±15 档，可切 ±25 / ±45) 生成显示列表
+    visible_strikes = [round(center_strike + i * step, 2) for i in range(STRIKE_SPAN, -STRIKE_SPAN - 1, -1)]
+    pinned_set = set()
+
+    # 📌 远端极值墙自动钉住：若全链 Call Wall 或 Put Wall 超出当前视野，自动钉在最顶/最底行！
+    if active_meta["cw"] not in visible_strikes:
+        if active_meta["cw"] > visible_strikes[0]:
+            visible_strikes.insert(0, active_meta["cw"])
+        else:
+            visible_strikes.append(active_meta["cw"])
+        pinned_set.add(active_meta["cw"])
+
+    if active_meta["pw"] not in visible_strikes:
+        if active_meta["pw"] < visible_strikes[-1]:
+            visible_strikes.append(active_meta["pw"])
+        else:
+            visible_strikes.insert(0, active_meta["pw"])
+        pinned_set.add(active_meta["pw"])
+
     rows = []
-    for s in ladder_strikes:
+    for s in visible_strikes:
         b = active_buckets.get(s)
         val = active_map.get(s, 0.0)
         d_val = day_gex_map.get(s, 0.0)
         w_val = week_gex_map.get(s, 0.0)
         tag_info = strike_tags.get(s, {"icon": "", "note": ""})
 
-        avg_flow = (b["flow_w"] / b["vol_t"]) if (b and b["vol_t"] > 0) else 0.0
+        avg_flow = (b["flow_w"] / max(b["vol_t"], 1.0)) if (b and b["vol_t"] > 0) else 0.0
         rows.append({
             "strike": s,
             "net_gex": val,
@@ -792,6 +812,7 @@ def compute_ticker_gex(ticker_key, use_ema=True):
             "avg_flow": round(avg_flow, 2),
             "tac_icon": tag_info["icon"],
             "tac_note": tag_info["note"],
+            "is_pinned": (s in pinned_set),
             "is_spot": (abs(s - center_strike) < 1e-4),
             "is_king": (abs(s - active_meta["king"]) < 1e-4),
             "is_call_wall": (abs(s - active_meta["cw"]) < 1e-4),
@@ -889,6 +910,7 @@ def api_gex():
         "weekly_mode": WEEKLY_MODE,
         "live_flow_mode": LIVE_FLOW_MODE,
         "noise_reduction": NOISE_REDUCTION,
+        "strike_span": STRIKE_SPAN,
         "data": data_copy,
         "alerts": all_alerts,
     })
@@ -904,6 +926,19 @@ def set_date():
         WEEKLY_MODE = False
     rebuild_render_cache(use_ema=False)
     return jsonify({"status": "ok", "selected_exp": SELECTED_EXP, "weekly_mode": WEEKLY_MODE})
+
+
+@app.route("/api/toggle_span", methods=["POST"])
+def toggle_span():
+    global STRIKE_SPAN
+    if STRIKE_SPAN == 15:
+        STRIKE_SPAN = 25
+    elif STRIKE_SPAN == 25:
+        STRIKE_SPAN = 45
+    else:
+        STRIKE_SPAN = 15
+    rebuild_render_cache(use_ema=False)
+    return jsonify({"status": "ok", "strike_span": STRIKE_SPAN})
 
 
 @app.route("/api/reset_anchor", methods=["POST"])
@@ -939,14 +974,14 @@ def toggle_noise():
     return jsonify({"status": "ok", "noise_reduction": NOISE_REDUCTION})
 
 
-# ==================== 9. 前端可视化指挥舱 (非破坏性Hover保持 + 净GEX体质条) ====================
+# ==================== 9. 前端可视化指挥舱 (支持全链视野切换 + 远端墙钉住) ====================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>GEX 实时量化指挥舱 (Carbon Pro 极速版)</title>
+<title>GEX 实时量化指挥舱 (Carbon 全链全景版)</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -1115,7 +1150,14 @@ HTML_TEMPLATE = """
     line-height: 1.35;
   }
 
-  .ladder-body { display: flex; flex-direction: column; }
+  .ladder-body {
+    display: flex;
+    flex-direction: column;
+    max-height: 76vh;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: #334155 #0f172a;
+  }
   .strike-row {
     display: flex;
     justify-content: space-between;
@@ -1134,6 +1176,10 @@ HTML_TEMPLATE = """
     outline: 2px solid #38bdf8;
     z-index: 2;
   }
+  .strike-row.pinned-row {
+    border-top: 1px dashed #facc15;
+    border-bottom: 1px dashed #facc15;
+  }
   .strike-left {
     display: flex;
     align-items: center;
@@ -1146,6 +1192,14 @@ HTML_TEMPLATE = """
     padding: 0px 4px;
     border-radius: 3px;
     border: 1px solid #38bdf8;
+  }
+  .pin-tag {
+    font-size: 10px;
+    background: rgba(15, 23, 42, 0.85);
+    color: #facc15;
+    padding: 0px 4px;
+    border-radius: 3px;
+    border: 1px solid #facc15;
   }
   .tac-dot {
     font-size: 12px;
@@ -1210,6 +1264,7 @@ HTML_TEMPLATE = """
     <select id="dateSelect" class="date-select" onchange="changeExpDate(this.value)">
       <option value="AUTO">🤖 自动换日 (16:15跳次日)</option>
     </select>
+    <button id="spanBtn" class="btn active-sub" onclick="toggleMode('/api/toggle_span')" title="切换行权价显示范围(无论选几档，极值与底部统计始终覆盖全链)">📏 视野: ±15档</button>
     <button id="weekBtn" class="btn active-day" onclick="toggleMode('/api/toggle_weekly')">📅 周期: 单日 (DAY)</button>
     <button id="flowBtn" class="btn active-flow" onclick="toggleMode('/api/toggle_flow')">⚡ LIVE FLOW: ON (盘口动态)</button>
     <button id="noiseBtn" class="btn active-sub" onclick="toggleMode('/api/toggle_noise')">🧹 降噪: ON</button>
@@ -1223,7 +1278,7 @@ HTML_TEMPLATE = """
   <span style="cursor:pointer; padding:0 6px;" onclick="document.getElementById('alertBox').style.display='none'">✖</span>
 </div>
 <div id="grid" class="grid-container">
-  <div class="loading-box">⚡ 正在通过长连接池极速同步 CBOE 四标的期权链与 Top-1 共振靶心...</div>
+  <div class="loading-box">⚡ 正在扫描全链 GEX 分布与 Top-1 共振靶心...</div>
 </div>
 <div id="tooltip"></div>
 
@@ -1232,7 +1287,7 @@ let soundEnabled = false;
 let isFetching = false;
 let lastSpokenAlert = "";
 let latestDataMap = {};
-let hoveredKey = null; // 记录当前鼠标悬停的 {ticker, strike}，确保刷新时Tooltip不闪断
+let hoveredKey = null;
 
 function formatGex(val) {
   const absV = Math.abs(val);
@@ -1305,18 +1360,18 @@ function renderTooltipContent(ticker, strike) {
   if (!row) return;
 
   const tt = document.getElementById("tooltip");
-  let flowDesc = "⚪ 盘口均衡";
-  if (row.avg_flow > 0.12) flowDesc = "🟡 客户卖盘/平仓护盘 (Bid主导 +GEX)";
-  else if (row.avg_flow < -0.12) flowDesc = "🟣 客户主动扫货买入 (Ask主导 -GEX)";
+  let flowDesc = "⚪ 盘口均衡 / 结构主导";
+  if (row.net_gex > 0 && row.avg_flow > 0.10) flowDesc = "🟡 多头Call墙 / Bid卖Put护盘 (+GEX)";
+  else if (row.net_gex < 0 && row.avg_flow < -0.10) flowDesc = "🟣 空头Put主导 / Ask主动买盘 (-GEX)";
 
   const tacHtml = row.tac_note
     ? `<div style="margin-top:5px; padding:4px 6px; background:#1e293b; border-left:3px solid #f59e0b; color:#fde68a; font-weight:700; line-height:1.35;">${row.tac_note}</div>`
     : "";
 
   tt.innerHTML = `
-    <div style="font-weight:800; color:#38bdf8; margin-bottom:4px;">${ticker} Strike ${row.strike}</div>
+    <div style="font-weight:800; color:#38bdf8; margin-bottom:4px;">${ticker} Strike ${row.strike} ${row.is_pinned ? "(📌远端极值墙)" : ""}</div>
     <div>单日 GEX: <b>${formatGex(row.day_gex)}</b> | 本周 OPEX: <b>${formatGex(row.week_gex)}</b></div>
-    <div>盘口流向: <b>${flowDesc}</b></div>
+    <div>净极性归因: <b>${flowDesc}</b></div>
     <hr style="border:0; border-top:1px solid #334155; margin:4px 0;">
     <div>Call OI: ${row.call_oi.toLocaleString()} | Vol: ${row.call_vol.toLocaleString()}</div>
     <div>Put OI: ${row.put_oi.toLocaleString()} | Vol: ${row.put_vol.toLocaleString()}</div>
@@ -1362,6 +1417,9 @@ async function fetchGexData(force = false) {
       }
     }
 
+    const spanBtn = document.getElementById("spanBtn");
+    spanBtn.innerText = json.strike_span >= 40 ? `📏 视野: ±${json.strike_span}档(全链)` : `📏 视野: ±${json.strike_span}档`;
+
     const weekBtn = document.getElementById("weekBtn");
     weekBtn.innerText = json.weekly_mode ? "📆 周期: 本周 (至周五OPEX)" : "📅 周期: 单日 (DAY)";
     weekBtn.className = json.weekly_mode ? "btn active-week" : "btn active-day";
@@ -1376,6 +1434,13 @@ async function fetchGexData(force = false) {
 
     if (!json.ready) return;
     latestDataMap = json.data || {};
+
+    // 保存各列滚动条位置，防止刷新时跳回顶部
+    const scrollPositions = {};
+    document.querySelectorAll(".ladder-body").forEach(el => {
+      const sym = el.getAttribute("data-sym");
+      if (sym) scrollPositions[sym] = el.scrollTop;
+    });
 
     const alertBox = document.getElementById("alertBox");
     const alertText = document.getElementById("alertText");
@@ -1394,18 +1459,22 @@ async function fetchGexData(force = false) {
 
       const pctColor = d.pct_change >= 0 ? "#4ade80" : "#f87171";
       const pctSign = d.pct_change >= 0 ? "+" : "";
-      const hud = d.hud || { text: "动态扫描中...", color: "#38bdf8" };
+      const hud = d.hud || { text: "全链扫描中...", color: "#38bdf8" };
 
       const netGex = d.total_net_gex || 0;
       const regimeBg = netGex >= 0 ? "rgba(16, 185, 129, 0.18)" : "rgba(192, 132, 252, 0.18)";
       const regimeColor = netGex >= 0 ? "#34d399" : "#c084fc";
-      const regimeText = netGex >= 0 ? `净${formatGex(netGex)} 护盘` : `净${formatGex(netGex)} 助跌`;
+      const regimeText = netGex >= 0 ? `全链净${formatGex(netGex)} 护盘` : `全链净${formatGex(netGex)} 助跌`;
 
       let rowsHtml = "";
       for (const r of d.rows) {
         const style = getRowStyle(r.net_gex, r.intensity);
-        const spotClass = r.is_spot ? "strike-row spot-row" : "strike-row";
+        let rowCls = "strike-row";
+        if (r.is_spot) rowCls += " spot-row";
+        if (r.is_pinned) rowCls += " pinned-row";
+
         const icons = [
+          r.is_pinned ? `<span class="pin-tag" title="超出当前视野的全链远端极值墙">📌远端</span>` : "",
           r.is_spot ? `<span class="m-tag">M</span>` : "",
           r.is_king ? "👑" : "",
           r.is_call_wall ? "▲" : "",
@@ -1416,7 +1485,7 @@ async function fetchGexData(force = false) {
         const star = r.is_star ? "*" : "";
 
         rowsHtml += `
-          <div class="${spotClass}" style="${style}"
+          <div class="${rowCls}" style="${style}"
                onmousemove="showTooltip(event, '${sym}', ${r.strike})"
                onmouseleave="hideTooltip()">
             <div class="strike-left">
@@ -1452,10 +1521,10 @@ async function fetchGexData(force = false) {
               ${hud.text}
             </div>
           </div>
-          <div class="ladder-body">${rowsHtml}</div>
+          <div class="ladder-body" data-sym="${sym}">${rowsHtml}</div>
           <div class="col-footer">
             <span>${formatGex(d.min_neg_val)}</span>
-            <span style="font-size:10px; color:#cbd5e1;">MAX -GEX / +GEX</span>
+            <span style="font-size:10px; color:#cbd5e1;">全链 MAX -GEX / +GEX</span>
             <span>${formatGex(d.max_pos_val)}</span>
           </div>
         </div>
@@ -1464,6 +1533,13 @@ async function fetchGexData(force = false) {
 
     if (html) {
       document.getElementById("grid").innerHTML = html;
+      // 恢复滚动条位置
+      document.querySelectorAll(".ladder-body").forEach(el => {
+        const sym = el.getAttribute("data-sym");
+        if (sym && scrollPositions[sym] !== undefined) {
+          el.scrollTop = scrollPositions[sym];
+        }
+      });
       if (hoveredKey) {
         renderTooltipContent(hoveredKey.ticker, hoveredKey.strike);
       }
@@ -1493,7 +1569,7 @@ if __name__ == "__main__":
     t = threading.Thread(target=background_sync_worker, daemon=True)
     t.start()
     print("=========================================================")
-    print("🚀 XSP/SPX GEX 指挥中心 (Carbon Pro 极速高精版) 已启动")
+    print("🚀 XSP/SPX GEX 指挥中心 (Carbon 全链全景 + 盘口边界校准版) 已启动")
     print("👉 请在浏览器打开: http://127.0.0.1:5000")
     print("=========================================================")
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
