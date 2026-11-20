@@ -4,6 +4,7 @@ import subprocess
 import math
 import time
 import threading
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta, date
 import requests
@@ -31,11 +32,18 @@ SPOT_SYNC_INTERVAL = 5.0   # 毫秒级现价每 5 秒同步一次
 CHAIN_SYNC_INTERVAL = 20.0 # CBOE 全链每 20 秒同步一次 (未重拉时靠实时现价重算 BS-Gamma)
 CHAIN_MAX_WORKERS = 2      # 限制全链并发为 2，防止 OPEX 日同时解析4个20MB JSON 导致云端 OOM
 
+# 趋势曲线与单档显著异动参数
+NET_HISTORY_SAMPLE_SEC = 10.0  # 全链净值趋势图每10秒采样1个点
+NET_HISTORY_MAX_POINTS = 180   # 最多保留180个点 (约30分钟连续走势)
+DELTA_LOOKBACK_SEC = 60.0      # 单档异动回看窗口 (60秒滚动净变化，兼顾EMA平滑与CBOE CDN缓存周期)
+DELTA_REL_RATIO = 0.035        # 动态相对阈值: 变化量 >= 本列最大单档绝对值的 3.5%
+
 TICKERS = {
-    "SPX": {"cboe": "_SPX", "yf": "^GSPC", "cnbc": ".SPX", "step": 5.0, "def_iv": 0.16},
-    "XSP": {"cboe": "_XSP", "yf": "^XSP",  "cnbc": ".XSP", "step": 1.0, "def_iv": 0.16},
-    "SPY": {"cboe": "SPY",  "yf": "SPY",   "cnbc": "SPY",  "step": 1.0, "def_iv": 0.16},
-    "QQQ": {"cboe": "QQQ",  "yf": "QQQ",   "cnbc": "QQQ",  "step": 1.0, "def_iv": 0.21},
+    # delta_floor 单位为 $M (百万美元)：过滤日常杂波的绝对底线，与 3.5% 相对阈值取较大值
+    "SPX": {"cboe": "_SPX", "yf": "^GSPC", "cnbc": ".SPX", "step": 5.0, "def_iv": 0.16, "delta_floor": 0.35},
+    "XSP": {"cboe": "_XSP", "yf": "^XSP",  "cnbc": ".XSP", "step": 1.0, "def_iv": 0.16, "delta_floor": 0.05},
+    "SPY": {"cboe": "SPY",  "yf": "SPY",   "cnbc": "SPY",  "step": 1.0, "def_iv": 0.16, "delta_floor": 0.80},
+    "QQQ": {"cboe": "QQQ",  "yf": "QQQ",   "cnbc": "QQQ",  "step": 1.0, "def_iv": 0.21, "delta_floor": 0.35},
 }
 
 # 云端防拦截请求头：移除 no-cache 穿透头，正常命中 CBOE 边缘 CDN 缓存
@@ -61,15 +69,17 @@ HTTP_SESSION.mount("https://", _adapter)
 HTTP_SESSION.mount("http://", _adapter)
 
 # ==================== 内存持久化状态池 ====================
-RAW_CHAIN_CACHE = {}      # 缓存CBOE原始期权链 (覆盖现价±8%全链)
-CHAIN_VOL_STAMP = {}      # CDN防倒退校验戳
-FLOW_LEDGER = {}          # 增量订单流账本: {opt_sym: {"vol": float, "signed_vol": float}}
-EMA_GEX_CACHE = {}        # 行权价级别EMA平滑缓存
-SPOT_CACHE = {}           # 实时现价缓存
-RENDER_CACHE = {}         # 前端秒读缓存
-INTRADAY_ANCHOR = {}      # 盘中主力移仓对比基准
-ALERT_COOLDOWN = {}       # 智能语音冷却锁
-SYNC_DIAGNOSTICS = {}     # 云端链路诊断透传字典 {ticker: status_str}
+RAW_CHAIN_CACHE = {}       # 缓存CBOE原始期权链 (覆盖现价±8%全链)
+CHAIN_VOL_STAMP = {}       # CDN防倒退校验戳
+FLOW_LEDGER = {}           # 增量订单流账本: {opt_sym: {"vol": float, "signed_vol": float}}
+EMA_GEX_CACHE = {}         # 行权价级别EMA平滑缓存
+NET_GEX_HISTORY = {}       # 全链净值走势历史: {hist_key: deque([(epoch, "HH:MM", val, spot), ...])}
+STRIKE_DELTA_HISTORY = {}  # 单档60秒滚动变化追踪: {delta_key: deque([(epoch, val), ...])}
+SPOT_CACHE = {}            # 实时现价缓存
+RENDER_CACHE = {}          # 前端秒读缓存
+INTRADAY_ANCHOR = {}       # 盘中主力移仓对比基准
+ALERT_COOLDOWN = {}        # 智能语音冷却锁
+SYNC_DIAGNOSTICS = {}      # 云端链路诊断透传字典 {ticker: status_str}
 AVAIL_DATES_LIST = []
 ACTIVE_AUTO_DATE = ""
 ANCHOR_TIME_STR = "开盘初始"
@@ -262,7 +272,6 @@ def bs_live_gamma(spot, strike, iv, t_years):
 def fetch_cboe_raw_chain(ticker_key):
     cfg = TICKERS[ticker_key]
     cboe_sym = cfg["cboe"]
-    # 移除 ?_={ts_bucket} 强制缓存穿透，避免 Render 共享出口 IP 触发 CBOE WAF 403/429
     urls = [
         f"https://cdn.cboe.com/api/global/delayed_quotes/options/{cboe_sym}.json",
         f"https://cdn.cboe.com/api/global/delayed_quotes/options/{cboe_sym.replace('_', '')}.json",
@@ -272,7 +281,6 @@ def fetch_cboe_raw_chain(ticker_key):
     last_err = "未知网络错误"
     for url in urls:
         try:
-            # 适配 Render 低配容器与 OPEX 日超大 JSON (15~25MB)
             r = HTTP_SESSION.get(url, timeout=(5.0, 18.0))
             if r.status_code == 200:
                 raw_json = r.json()
@@ -306,7 +314,7 @@ def fetch_cboe_raw_chain(ticker_key):
 
     est_now = get_us_eastern_now()
     today_yymmdd = est_now.strftime("%y%m%d")
-    max_dist = spot * 0.08  # 保留 ±8% 全链数据，确保远端 Call/Put Wall 绝不丢失
+    max_dist = spot * 0.08
 
     filtered_opts = []
     avail_dates = set()
@@ -333,7 +341,6 @@ def fetch_cboe_raw_chain(ticker_key):
         vol = float(opt.get("volume", 0) or 0)
         total_chain_vol += vol
         avail_dates.add(yymmdd)
-        # 仅保留计算所需的精简字段，大幅降低 Render 512MB RAM 内存占用
         slim_opt = {
             "open_interest": opt.get("open_interest", 0),
             "volume": vol,
@@ -345,7 +352,6 @@ def fetch_cboe_raw_chain(ticker_key):
         }
         filtered_opts.append((sym, yymmdd, opt_type, strike, slim_opt))
 
-    # 尽快释放巨大的原始 JSON 引用
     del raw_json, data_block, options
 
     if not avail_dates:
@@ -375,12 +381,6 @@ def fetch_cboe_raw_chain(ticker_key):
 
 # ==================== 4. 严格盘口边界校验 + 结构极性保护订单流引擎 ====================
 def calc_calibrated_flow_polarity(opt_type, strike, spot, opt):
-    """
-    Carbon 校准版订单流极性算法：
-    1. 严格盘口内校验 (bid <= last_p <= ask)，屏蔽 0DTE 异步滞后报价导致的全屏翻紫 Bug。
-    2. Call 期权正极性保护，确保上方巨量 Call 墙正确呈现为黄/绿正 Gamma (+GEX)。
-    3. Put 期权底部卖盘铁底识别：当客户对着 Bid 主动卖出/平仓 Put 时翻正为黄色护盘铁底。
-    """
     bid = float(opt.get("bid", 0) or 0)
     ask = float(opt.get("ask", 0) or 0)
     last_p = float(opt.get("last_trade_price", 0) or 0)
@@ -508,6 +508,107 @@ def extract_full_chain_nodes(all_strikes, gex_map, spot, step):
         "total_net": total_net,
         "top_pos": top_pos, "top_neg": top_neg, "top_abs": top_abs,
     }
+
+
+# ==================== 5.5 全链净值走势采样 & 单档滚动异动引擎 ====================
+def record_and_get_net_history(ticker_key, target_d, mode_tag, total_net, spot, est_now, record_sample=True):
+    """按 (标的, 目标日期, 视图模式, 流向模式) 独立记录全链净值时间序列，供前端绘制走势曲线"""
+    hist_key = (ticker_key, target_d, mode_tag, LIVE_FLOW_MODE, NOISE_REDUCTION)
+    dq = NET_GEX_HISTORY.get(hist_key)
+    if dq is None:
+        dq = deque(maxlen=NET_HISTORY_MAX_POINTS)
+        NET_GEX_HISTORY[hist_key] = dq
+
+    now_ts = time.time()
+    hm_str = est_now.strftime("%H:%M")
+
+    if record_sample:
+        if not dq or (now_ts - dq[-1][0] >= NET_HISTORY_SAMPLE_SEC):
+            dq.append((now_ts, hm_str, round(total_net, 4), round(spot, 2)))
+        else:
+            # 10秒采样间隔内实时刷新末端点，保证最新数值与曲线末端无缝贴合
+            dq[-1] = (dq[-1][0], hm_str, round(total_net, 4), round(spot, 2))
+    elif not dq:
+        dq.append((now_ts, hm_str, round(total_net, 4), round(spot, 2)))
+
+    # 限制前端传输点数 <= 90 (轻量 JSON)，超过则等距抽稀保留首尾
+    pts = list(dq)
+    if len(pts) > 90:
+        step_idx = len(pts) / 90.0
+        sampled = [pts[int(i * step_idx)] for i in range(89)]
+        sampled.append(pts[-1])
+        pts = sampled
+
+    start_val = pts[0][2] if pts else total_net
+    trend_delta = total_net - start_val
+    span_mins = max(0, int((pts[-1][0] - pts[0][0]) / 60.0)) if len(pts) >= 2 else 0
+
+    return {
+        "points": [{"t": p[1], "v": p[2], "p": p[3]} for p in pts],
+        "start_val": round(start_val, 4),
+        "trend_delta": round(trend_delta, 4),
+        "span_mins": span_mins,
+    }
+
+
+def compute_strike_rolling_delta(ticker_key, strike, target_d, mode_tag, cur_val, max_abs, record_sample=True):
+    """
+    计算单档 60 秒滚动净变化 (delta_gex) 并执行自适应显著性过滤：
+    - 阈值 = max(标的绝对底线, 本列最大单档绝对值 * 3.5%)
+    - 异动等级: 0=不显示(杂波) | 1=值得留意(普通显著) | 2=主力急剧扫货/撤单(>= 2.5倍阈值)
+    """
+    d_key = (ticker_key, strike, target_d, mode_tag, LIVE_FLOW_MODE, NOISE_REDUCTION)
+    dq = STRIKE_DELTA_HISTORY.get(d_key)
+    if dq is None:
+        dq = deque(maxlen=16)
+        STRIKE_DELTA_HISTORY[d_key] = dq
+
+    now_ts = time.time()
+    if record_sample:
+        # 清理超出回看窗口(70s)的旧点，但至少保留1个基准点
+        while len(dq) > 1 and (now_ts - dq[0][0] > DELTA_LOOKBACK_SEC + 10.0):
+            dq.popleft()
+        if not dq or (now_ts - dq[-1][0] >= 4.0):
+            dq.append((now_ts, cur_val))
+
+    if len(dq) < 2:
+        return 0.0, 0, 0.0
+
+    # 寻找最接近 60 秒前的基准快照；启动初期则自动以最早快照为基准
+    base_val = dq[0][1]
+    for ts_i, val_i in dq:
+        if now_ts - ts_i >= DELTA_LOOKBACK_SEC * 0.75:
+            base_val = val_i
+        else:
+            break
+
+    delta_val = cur_val - base_val
+    floor_m = TICKERS[ticker_key]["delta_floor"]
+    threshold = max(floor_m, max_abs * DELTA_REL_RATIO)
+
+    abs_d = abs(delta_val)
+    if abs_d >= threshold * 2.5:
+        sig_level = 2
+    elif abs_d >= threshold:
+        sig_level = 1
+    else:
+        sig_level = 0
+
+    return round(delta_val, 4), sig_level, round(threshold, 4)
+
+
+def prune_history_caches():
+    """防止跨日运行导致内存缓存无限增长 (保障 Render 512MB RAM 稳定)"""
+    if len(STRIKE_DELTA_HISTORY) > 6000:
+        now_ts = time.time()
+        stale = [k for k, dq in STRIKE_DELTA_HISTORY.items() if not dq or (now_ts - dq[-1][0] > 600)]
+        for k in stale:
+            STRIKE_DELTA_HISTORY.pop(k, None)
+    if len(NET_GEX_HISTORY) > 64:
+        now_ts = time.time()
+        stale = [k for k, dq in NET_GEX_HISTORY.items() if not dq or (now_ts - dq[-1][0] > 3600)]
+        for k in stale:
+            NET_GEX_HISTORY.pop(k, None)
 
 
 # ==================== 6. 全链 Top-1 唯一主靶心收敛 + 盘中移仓追踪引擎 ====================
@@ -683,7 +784,7 @@ def analyze_dynamic_resonance_and_shifts(ticker_key, target_d, spot, step, all_s
     return strike_tags, hud, dynamic_alerts
 
 
-# ==================== 7. 全链并行计算 + 远端极值钉住引擎 ====================
+# ==================== 7. 全链并行计算 + 曲线追踪 + 显著异动标注引擎 ====================
 def compute_ticker_gex(ticker_key, use_ema=True):
     raw = RAW_CHAIN_CACHE.get(ticker_key)
     if not raw:
@@ -820,13 +921,19 @@ def compute_ticker_gex(ticker_key, use_ema=True):
     day_meta = extract_full_chain_nodes(full_chain_strikes, day_gex_map, spot, step)
     week_meta = extract_full_chain_nodes(full_chain_strikes, week_gex_map, spot, step)
 
+    # 双周期同时记录全链净值趋势，确保切换 日/周 模式时历史曲线无缝衔接
+    day_hist = record_and_get_net_history(ticker_key, target_d, "DAY", day_meta["total_net"], spot, est_now, record_sample=use_ema)
+    week_hist = record_and_get_net_history(ticker_key, target_d, "WEEK", week_meta["total_net"], spot, est_now, record_sample=use_ema)
+
     strike_tags, hud, dynamic_alerts = analyze_dynamic_resonance_and_shifts(
         ticker_key, target_d, spot, step, full_chain_strikes, day_gex_map, week_gex_map, day_meta, week_meta
     )
 
+    active_mode = "WEEK" if WEEKLY_MODE else "DAY"
     active_buckets = week_buckets if WEEKLY_MODE else day_buckets
     active_map = week_gex_map if WEEKLY_MODE else day_gex_map
     active_meta = week_meta if WEEKLY_MODE else day_meta
+    active_hist = week_hist if WEEKLY_MODE else day_hist
 
     visible_strikes = [round(center_strike + i * step, 2) for i in range(STRIKE_SPAN, -STRIKE_SPAN - 1, -1)]
     pinned_set = set()
@@ -846,6 +953,7 @@ def compute_ticker_gex(ticker_key, use_ema=True):
         pinned_set.add(active_meta["pw"])
 
     rows = []
+    active_threshold = max(cfg["delta_floor"], active_meta["max_abs"] * DELTA_REL_RATIO)
     for s in visible_strikes:
         b = active_buckets.get(s)
         val = active_map.get(s, 0.0)
@@ -853,10 +961,17 @@ def compute_ticker_gex(ticker_key, use_ema=True):
         w_val = week_gex_map.get(s, 0.0)
         tag_info = strike_tags.get(s, {"icon": "", "note": ""})
 
+        # 计算单档 60s 滚动净变化及显著性等级 (0=静默, 1=显著留意, 2=剧烈扫货/撤单)
+        delta_val, delta_sig, _ = compute_strike_rolling_delta(
+            ticker_key, s, target_d, active_mode, val, active_meta["max_abs"], record_sample=use_ema
+        )
+
         avg_flow = (b["flow_w"] / max(b["vol_t"], 1.0)) if (b and b["vol_t"] > 0) else 0.0
         rows.append({
             "strike": s,
             "net_gex": val,
+            "delta_gex": delta_val,
+            "delta_sig": delta_sig,
             "day_gex": d_val,
             "week_gex": w_val,
             "call_oi": b["call_oi"] if b else 0,
@@ -889,6 +1004,8 @@ def compute_ticker_gex(ticker_key, use_ema=True):
         "max_pos_val": active_meta["max_pos"],
         "min_neg_val": active_meta["min_neg"],
         "total_net_gex": active_meta["total_net"],
+        "delta_threshold": round(active_threshold, 4),
+        "net_history": active_hist,
         "hud": hud,
         "rows": rows,
         "alerts": dynamic_alerts,
@@ -927,23 +1044,19 @@ def rebuild_render_cache(use_ema=True):
 
 
 def background_sync_worker():
-    """双速解耦后台守护线程：5秒高频刷现价 + 20秒低并发拉全链 + GC 防内存溢出"""
     global LAST_CHAIN_SYNC_TS
     while True:
         try:
-            # 1. 每 5 秒极速更新四大标的实时现价
             update_all_spots()
-
-            # 2. 首次启动立即拉取，或每 20 秒低并发更新 CBOE 全链 (max_workers=2 保护云端 RAM)
             now_t = time.time()
             need_chain = (len(RAW_CHAIN_CACHE) < 4) or (now_t - LAST_CHAIN_SYNC_TS >= CHAIN_SYNC_INTERVAL)
             if need_chain:
                 with ThreadPoolExecutor(max_workers=CHAIN_MAX_WORKERS) as ex:
                     list(ex.map(fetch_cboe_raw_chain, ["SPX", "XSP", "SPY", "QQQ"]))
                 LAST_CHAIN_SYNC_TS = time.time()
+                prune_history_caches()
                 gc.collect()
 
-            # 3. 结合最新现价动态重算 BS-Gamma 并刷新前端内存缓存
             rebuild_render_cache(use_ema=True)
         except Exception as e:
             print("Background sync warning:", e)
@@ -1054,14 +1167,14 @@ def toggle_noise():
     return jsonify({"status": "ok", "noise_reduction": NOISE_REDUCTION})
 
 
-# ==================== 9. 前端可视化指挥舱 (支持诊断透传 + 全链视野切换) ====================
+# ==================== 9. 前端可视化指挥舱 (含全链净值趋势图 + 行内显著异动中栏) ====================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>GEX 实时量化指挥舱 (Carbon 云端防拦截高精版)</title>
+<title>GEX 实时量化指挥舱 (Carbon 趋势曲线 + 异动脉冲版)</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -1194,7 +1307,7 @@ HTML_TEMPLATE = """
     align-items: baseline;
     font-weight: 800;
     font-size: 14px;
-    margin-bottom: 6px;
+    margin-bottom: 5px;
   }
   .pct-tag {
     font-size: 11px;
@@ -1224,12 +1337,53 @@ HTML_TEMPLATE = """
   .pill-flip { color: #60a5fa; border: 1px solid #1d4ed8; }
   .pill-call { color: #facc15; border: 1px solid #a16207; }
   .pill-put  { color: #c084fc; border: 1px solid #6b21a8; }
-  .regime-tag {
+  .thresh-pill {
     font-size: 10px;
-    font-weight: 800;
-    padding: 2px 6px;
+    color: #94a3b8;
+    background: rgba(15, 23, 42, 0.7);
+    border: 1px solid #334155;
+    padding: 1px 5px;
     border-radius: 4px;
   }
+
+  /* 全链净值走势面板 */
+  .net-trend-box {
+    background: rgba(10, 14, 26, 0.88);
+    border: 1px solid #24304a;
+    border-radius: 6px;
+    padding: 5px 8px 4px 8px;
+    margin-bottom: 6px;
+  }
+  .net-trend-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 3px;
+    gap: 4px;
+  }
+  .net-val-main {
+    font-size: 12px;
+    font-weight: 800;
+    letter-spacing: -0.2px;
+  }
+  .net-val-delta {
+    font-size: 10px;
+    font-weight: 700;
+    white-space: nowrap;
+  }
+  .spark-wrap {
+    width: 100%;
+    height: 30px;
+    position: relative;
+  }
+  .spark-meta {
+    display: flex;
+    justify-content: space-between;
+    font-size: 9px;
+    color: #64748b;
+    margin-top: 1px;
+  }
+
   .tactical-hud {
     font-size: 11px;
     font-weight: 700;
@@ -1242,15 +1396,17 @@ HTML_TEMPLATE = """
   .ladder-body {
     display: flex;
     flex-direction: column;
-    max-height: 76vh;
+    max-height: 70vh;
     overflow-y: auto;
     scrollbar-width: thin;
     scrollbar-color: #334155 #0f172a;
   }
+  /* 三栏精准网格: 左=点数+图标 | 中=显著变化数值 | 右=当前GEX */
   .strike-row {
-    display: flex;
-    justify-content: space-between;
+    display: grid;
+    grid-template-columns: 1fr auto minmax(64px, auto);
     align-items: center;
+    gap: 6px;
     padding: 4px 10px;
     font-size: 13px;
     font-weight: 700;
@@ -1273,7 +1429,49 @@ HTML_TEMPLATE = """
     display: flex;
     align-items: center;
     gap: 4px;
+    min-width: 0;
   }
+  .strike-mid {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+  }
+  .strike-right {
+    text-align: right;
+    white-space: nowrap;
+  }
+  /* 行内显著变化胶囊 (在亮黄与深紫背景上均高对比可读) */
+  .delta-badge {
+    font-size: 10px;
+    font-weight: 800;
+    padding: 1px 5px;
+    border-radius: 4px;
+    white-space: nowrap;
+    letter-spacing: -0.2px;
+    background: rgba(11, 15, 28, 0.88);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
+  }
+  .delta-up-1 {
+    color: #34d399;
+    border: 1px solid rgba(52, 211, 153, 0.65);
+  }
+  .delta-up-2 {
+    color: #ecfdf5;
+    background: rgba(5, 150, 105, 0.94);
+    border: 1px solid #6ee7b7;
+    box-shadow: 0 0 8px rgba(52, 211, 153, 0.55);
+  }
+  .delta-dn-1 {
+    color: #fb7185;
+    border: 1px solid rgba(251, 113, 133, 0.65);
+  }
+  .delta-dn-2 {
+    color: #fff1f2;
+    background: rgba(190, 18, 60, 0.94);
+    border: 1px solid #fda4af;
+    box-shadow: 0 0 8px rgba(251, 113, 133, 0.55);
+  }
+
   .m-tag {
     font-size: 10px;
     background: rgba(15, 23, 42, 0.85);
@@ -1325,7 +1523,7 @@ HTML_TEMPLATE = """
     z-index: 9999;
     pointer-events: none;
     box-shadow: 0 8px 24px rgba(0,0,0,0.75);
-    max-width: 320px;
+    max-width: 330px;
   }
   .alert-banner {
     display: none;
@@ -1369,7 +1567,7 @@ HTML_TEMPLATE = """
   <span style="cursor:pointer; padding:0 6px;" onclick="document.getElementById('alertBox').style.display='none'">✖</span>
 </div>
 <div id="grid" class="grid-container">
-  <div class="loading-box">⚡ 正在扫描全链 GEX 分布与 Top-1 共振靶心...</div>
+  <div class="loading-box">⚡ 正在扫描全链 GEX 走势曲线与单档显著异动脉冲...</div>
 </div>
 <div id="tooltip"></div>
 
@@ -1386,6 +1584,95 @@ function formatGex(val) {
   if (absV >= 1.0) return `${sign}$${absV.toFixed(1)}M`;
   if (absV >= 0.001) return `${sign}$${(absV * 1000).toFixed(0)}K`;
   return "$0";
+}
+
+function formatGexCompact(val) {
+  const absV = Math.abs(val);
+  const sign = val > 0 ? "+" : (val < 0 ? "-" : "");
+  if (absV >= 10.0) return `${sign}${absV.toFixed(1)}M`;
+  if (absV >= 1.0) return `${sign}${absV.toFixed(2)}M`;
+  if (absV >= 0.001) return `${sign}${(absV * 1000).toFixed(0)}K`;
+  return "0";
+}
+
+function buildNetSparklineSVG(sym, netHist, currentVal) {
+  const pts = (netHist && netHist.points) ? netHist.points : [];
+  const W = 220, H = 30, PAD_Y = 3;
+
+  if (pts.length === 0) {
+    return `<svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}"><line x1="0" y1="${H/2}" x2="${W}" y2="${H/2}" stroke="#334155" stroke-dasharray="2,2"/></svg>`;
+  }
+
+  const vals = pts.map(p => p.v);
+  let minV = Math.min(...vals);
+  let maxV = Math.max(...vals);
+  // 若跨越 0 轴或贴近 0 轴，把 0 纳入坐标系以便直观看到正负切换
+  if (minV < 0 && maxV > 0) {
+    // 已经跨越 0 轴
+  } else if (Math.abs(minV) < (maxV - minV) * 0.5 || Math.abs(maxV) < (maxV - minV) * 0.5) {
+    minV = Math.min(minV, 0);
+    maxV = Math.max(maxV, 0);
+  }
+
+  let range = maxV - minV;
+  if (range < 1e-4) {
+    range = Math.max(Math.abs(maxV) * 0.2, 0.1);
+    minV -= range / 2;
+    maxV += range / 2;
+  }
+
+  const mapY = (v) => PAD_Y + ((maxV - v) / (maxV - minV)) * (H - PAD_Y * 2);
+  const zeroY = Math.max(PAD_Y, Math.min(H - PAD_Y, mapY(0)));
+  const zeroPct = Math.max(0, Math.min(100, (zeroY / H) * 100)).toFixed(1);
+
+  if (pts.length === 1) {
+    const y = mapY(vals[0]).toFixed(1);
+    const col = vals[0] >= 0 ? "#34d399" : "#c084fc";
+    return `
+      <svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" preserveAspectRatio="none">
+        <line x1="0" y1="${zeroY.toFixed(1)}" x2="${W}" y2="${zeroY.toFixed(1)}" stroke="#334155" stroke-width="0.8" stroke-dasharray="2,2"/>
+        <line x1="0" y1="${y}" x2="${W - 4}" y2="${y}" stroke="${col}" stroke-width="1.6" stroke-dasharray="3,2"/>
+        <circle cx="${W - 4}" cy="${y}" r="2.8" fill="${col}"/>
+      </svg>`;
+  }
+
+  const coords = pts.map((p, idx) => {
+    const x = (idx / (pts.length - 1)) * (W - 4);
+    const y = mapY(p.v);
+    return [x, y];
+  });
+
+  const linePoints = coords.map(c => `${c[0].toFixed(1)},${c[1].toFixed(1)}`).join(" ");
+  const lastX = coords[coords.length - 1][0].toFixed(1);
+  const lastY = coords[coords.length - 1][1].toFixed(1);
+  const areaPath = `M 0,${zeroY.toFixed(1)} L ` + coords.map(c => `${c[0].toFixed(1)},${c[1].toFixed(1)}`).join(" L ") + ` L ${lastX},${zeroY.toFixed(1)} Z`;
+
+  const gradStrokeId = `sg_${sym}`;
+  const gradFillId = `fg_${sym}`;
+  const dotColor = currentVal >= 0 ? "#34d399" : "#c084fc";
+  const showZeroLine = (minV <= 0 && maxV >= 0);
+
+  return `
+    <svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" preserveAspectRatio="none">
+      <defs>
+        <linearGradient id="${gradStrokeId}" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stop-color="#34d399"/>
+          <stop offset="${zeroPct}%" stop-color="#34d399"/>
+          <stop offset="${zeroPct}%" stop-color="#c084fc"/>
+          <stop offset="100%" stop-color="#c084fc"/>
+        </linearGradient>
+        <linearGradient id="${gradFillId}" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stop-color="rgba(52, 211, 153, 0.30)"/>
+          <stop offset="${zeroPct}%" stop-color="rgba(52, 211, 153, 0.04)"/>
+          <stop offset="${zeroPct}%" stop-color="rgba(192, 132, 252, 0.04)"/>
+          <stop offset="100%" stop-color="rgba(192, 132, 252, 0.32)"/>
+        </linearGradient>
+      </defs>
+      ${showZeroLine ? `<line x1="0" y1="${zeroY.toFixed(1)}" x2="${W}" y2="${zeroY.toFixed(1)}" stroke="#475569" stroke-width="0.9" stroke-dasharray="2,2"/>` : ""}
+      <path d="${areaPath}" fill="url(#${gradFillId})"/>
+      <polyline points="${linePoints}" fill="none" stroke="url(#${gradStrokeId})" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>
+      <circle cx="${lastX}" cy="${lastY}" r="2.7" fill="${dotColor}" stroke="#0b0e17" stroke-width="0.8"/>
+    </svg>`;
 }
 
 function getRowStyle(gex, intensity) {
@@ -1455,6 +1742,10 @@ function renderTooltipContent(ticker, strike) {
   if (row.net_gex > 0 && row.avg_flow > 0.10) flowDesc = "🟡 多头Call墙 / Bid卖Put护盘 (+GEX)";
   else if (row.net_gex < 0 && row.avg_flow < -0.10) flowDesc = "🟣 空头Put主导 / Ask主动买盘 (-GEX)";
 
+  const dVal = row.delta_gex || 0;
+  const dColor = dVal > 0 ? "#34d399" : (dVal < 0 ? "#fb7185" : "#94a3b8");
+  const dTag = row.delta_sig >= 2 ? " ⚡(剧烈异动)" : (row.delta_sig === 1 ? " (显著变化)" : " (低于提醒阈值)");
+
   const tacHtml = row.tac_note
     ? `<div style="margin-top:5px; padding:4px 6px; background:#1e293b; border-left:3px solid #f59e0b; color:#fde68a; font-weight:700; line-height:1.35;">${row.tac_note}</div>`
     : "";
@@ -1462,6 +1753,7 @@ function renderTooltipContent(ticker, strike) {
   tt.innerHTML = `
     <div style="font-weight:800; color:#38bdf8; margin-bottom:4px;">${ticker} Strike ${row.strike} ${row.is_pinned ? "(📌远端极值墙)" : ""}</div>
     <div>单日 GEX: <b>${formatGex(row.day_gex)}</b> | 本周 OPEX: <b>${formatGex(row.week_gex)}</b></div>
+    <div>近60s变化: <b style="color:${dColor}">${formatGex(dVal)}</b><span style="font-size:10px; color:#94a3b8;">${dTag}</span></div>
     <div>净极性归因: <b>${flowDesc}</b></div>
     <hr style="border:0; border-top:1px solid #334155; margin:4px 0;">
     <div>Call OI: ${row.call_oi.toLocaleString()} | Vol: ${row.call_vol.toLocaleString()}</div>
@@ -1475,8 +1767,8 @@ function showTooltip(e, ticker, strike) {
   renderTooltipContent(ticker, strike);
   const tt = document.getElementById("tooltip");
   tt.style.display = "block";
-  tt.style.left = Math.min(e.clientX + 14, window.innerWidth - 330) + "px";
-  tt.style.top = Math.min(e.clientY + 14, window.innerHeight - 190) + "px";
+  tt.style.left = Math.min(e.clientX + 14, window.innerWidth - 340) + "px";
+  tt.style.top = Math.min(e.clientY + 14, window.innerHeight - 210) + "px";
 }
 
 function hideTooltip() {
@@ -1524,7 +1816,6 @@ async function fetchGexData(force = false) {
     noiseBtn.innerText = json.noise_reduction ? "🧹 降噪: ON" : "🧹 降噪: OFF";
     noiseBtn.className = json.noise_reduction ? "btn active-sub" : "btn";
 
-    // 云端链路诊断透传：未就绪时在中间提示，部分失败时在顶部黄条提示
     const diagBar = document.getElementById("diagBar");
     const diagEntries = json.diagnostics ? Object.entries(json.diagnostics) : [];
     const errEntries = diagEntries.filter(([k, v]) => !String(v).startsWith("OK"));
@@ -1575,10 +1866,22 @@ async function fetchGexData(force = false) {
       const pctSign = d.pct_change >= 0 ? "+" : "";
       const hud = d.hud || { text: "全链扫描中...", color: "#38bdf8" };
 
+      // 全链净值走势面板计算
       const netGex = d.total_net_gex || 0;
-      const regimeBg = netGex >= 0 ? "rgba(16, 185, 129, 0.18)" : "rgba(192, 132, 252, 0.18)";
-      const regimeColor = netGex >= 0 ? "#34d399" : "#c084fc";
-      const regimeText = netGex >= 0 ? `全链净${formatGex(netGex)} 护盘` : `全链净${formatGex(netGex)} 助跌`;
+      const netColor = netGex >= 0 ? "#34d399" : "#c084fc";
+      const netModeLabel = netGex >= 0 ? "护盘" : "助跌";
+      const nh = d.net_history || { points: [], start_val: netGex, trend_delta: 0, span_mins: 0 };
+      const tDelta = nh.trend_delta || 0;
+      const tDeltaColor = tDelta > 0 ? "#34d399" : (tDelta < 0 ? "#fb7185" : "#94a3b8");
+      const tArrow = tDelta > 0.001 ? "↗" : (tDelta < -0.001 ? "↘" : "→");
+      const spanTxt = nh.span_mins > 0 ? `近${nh.span_mins}m` : `实时(${nh.points.length}点)`;
+      const startTime = nh.points.length > 0 ? nh.points[0].t : "--:--";
+      const endTime = nh.points.length > 0 ? nh.points[nh.points.length - 1].t : "--:--";
+      const valsArr = nh.points.map(p => p.v);
+      const hiV = valsArr.length ? Math.max(...valsArr) : netGex;
+      const loV = valsArr.length ? Math.min(...valsArr) : netGex;
+      const sparkSvg = buildNetSparklineSVG(sym, nh, netGex);
+      const threshLabel = formatGexCompact(d.delta_threshold || 0).replace("+", "");
 
       let rowsHtml = "";
       for (const r of d.rows) {
@@ -1598,6 +1901,17 @@ async function fetchGexData(force = false) {
         ].join(" ");
         const star = r.is_star ? "*" : "";
 
+        // 仅当变化数值达到显著阈值 (delta_sig >= 1) 时才在点数和 GEX 中间渲染异动胶囊
+        let deltaHtml = "";
+        if (r.delta_sig >= 1 && Math.abs(r.delta_gex) > 0) {
+          const isUp = r.delta_gex > 0;
+          const badgeCls = isUp
+            ? (r.delta_sig >= 2 ? "delta-badge delta-up-2" : "delta-badge delta-up-1")
+            : (r.delta_sig >= 2 ? "delta-badge delta-dn-2" : "delta-badge delta-dn-1");
+          const prefix = r.delta_sig >= 2 ? "⚡" : (isUp ? "▲" : "▼");
+          deltaHtml = `<span class="${badgeCls}">${prefix}${formatGexCompact(r.delta_gex)}</span>`;
+        }
+
         rowsHtml += `
           <div class="${rowCls}" style="${style}"
                onmousemove="showTooltip(event, '${sym}', ${r.strike})"
@@ -1606,7 +1920,8 @@ async function fetchGexData(force = false) {
               <span>${r.strike}</span>
               <span>${icons}</span>
             </div>
-            <div>${formatGex(r.net_gex)}${star}</div>
+            <div class="strike-mid">${deltaHtml}</div>
+            <div class="strike-right">${formatGex(r.net_gex)}${star}</div>
           </div>
         `;
       }
@@ -1627,9 +1942,19 @@ async function fetchGexData(force = false) {
                 <span class="pill pill-call">▲${d.call_wall}</span>
                 <span class="pill pill-put">▼${d.put_wall}</span>
               </div>
-              <span class="regime-tag" style="background:${regimeBg}; color:${regimeColor}; border:1px solid ${regimeColor};">
-                ${regimeText}
-              </span>
+              <span class="thresh-pill" title="单档60秒变化超过该阈值才会在行内亮灯提醒">Δ≥${threshLabel}</span>
+            </div>
+            <div class="net-trend-box" title="全链净GEX走势 | 区间最高: ${formatGex(hiV)} | 区间最低: ${formatGex(loV)}">
+              <div class="net-trend-top">
+                <span class="net-val-main" style="color:${netColor}">全链净 ${formatGex(netGex)} ${netModeLabel}</span>
+                <span class="net-val-delta" style="color:${tDeltaColor}">${spanTxt} ${tArrow}${formatGexCompact(tDelta)}</span>
+              </div>
+              <div class="spark-wrap">${sparkSvg}</div>
+              <div class="spark-meta">
+                <span>${startTime} 始:${formatGexCompact(nh.start_val)}</span>
+                <span>低:${formatGexCompact(loV)} / 高:${formatGexCompact(hiV)}</span>
+                <span>${endTime}</span>
+              </div>
             </div>
             <div class="tactical-hud" style="border-left-color:${hud.color}; color:${hud.color};">
               ${hud.text}
@@ -1683,7 +2008,7 @@ if __name__ == "__main__":
     kill_stale_port_5000(port)
     ensure_worker_started()
     print("=========================================================")
-    print(f"🚀 XSP/SPX GEX 指挥中心 (Carbon 云端防拦截双速解耦版) 已启动 (Port {port})")
+    print(f"🚀 XSP/SPX GEX 指挥中心 (Carbon 趋势曲线 + 显著异动版) 已启动 (Port {port})")
     print(f"👉 本地访问: http://127.0.0.1:{port}")
     print("=========================================================")
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
