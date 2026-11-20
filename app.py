@@ -1,3 +1,4 @@
+import gc
 import os
 import subprocess
 import math
@@ -10,14 +11,25 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from flask import Flask, jsonify, render_template_string, request
 
+try:
+    from zoneinfo import ZoneInfo
+    NY_TZ = ZoneInfo("America/New_York")
+except Exception:
+    NY_TZ = None
+
 app = Flask(__name__)
 
 # ==================== 全局核心开关 ====================
-SELECTED_EXP = "AUTO"     # "AUTO" = 美东16:15收盘后自动跳下一交易日 | 或指定如 "261118"
+SELECTED_EXP = "AUTO"     # "AUTO" = 美东16:15收盘后自动跳下一交易日 | 或指定如 "261120"
 WEEKLY_MODE = False       # False = 📅 单日视图 | True = 📆 本周OPEX视图 (后台始终双周期并行计算)
 LIVE_FLOW_MODE = True     # True = StrikeGEX动态盘口流向(严格价差校验版) | False = 传统静态(Call正/Put负)
 NOISE_REDUCTION = True    # True = 过滤远端噪音，聚焦核心博弈区
 STRIKE_SPAN = 15          # 默认显示上下各15档(共31行)，支持前端一键切换 15 / 25 / 45(全链全景)
+
+# 双速解耦周期 (适配 Render 云端 512MB RAM & 0.1 vCPU，防 WAF 403/429 与读超时)
+SPOT_SYNC_INTERVAL = 5.0   # 毫秒级现价每 5 秒同步一次
+CHAIN_SYNC_INTERVAL = 20.0 # CBOE 全链每 20 秒同步一次 (未重拉时靠实时现价重算 BS-Gamma)
+CHAIN_MAX_WORKERS = 2      # 限制全链并发为 2，防止 OPEX 日同时解析4个20MB JSON 导致云端 OOM
 
 TICKERS = {
     "SPX": {"cboe": "_SPX", "yf": "^GSPC", "cnbc": ".SPX", "step": 5.0, "def_iv": 0.16},
@@ -26,41 +38,53 @@ TICKERS = {
     "QQQ": {"cboe": "QQQ",  "yf": "QQQ",   "cnbc": "QQQ",  "step": 1.0, "def_iv": 0.21},
 }
 
+# 云端防拦截请求头：移除 no-cache 穿透头，正常命中 CBOE 边缘 CDN 缓存
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate",
+    "Referer": "https://www.cboe.com/",
+    "Origin": "https://www.cboe.com",
     "Connection": "keep-alive",
-    "Cache-Control": "no-cache",
 }
 
 # ==================== 全局持久化连接池 ====================
 HTTP_SESSION = requests.Session()
 HTTP_SESSION.headers.update(HEADERS)
-_adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=Retry(total=1, backoff_factor=0.1))
+_adapter = HTTPAdapter(
+    pool_connections=16,
+    pool_maxsize=16,
+    max_retries=Retry(total=1, backoff_factor=0.2, status_forcelist=[502, 503, 504]),
+)
 HTTP_SESSION.mount("https://", _adapter)
 HTTP_SESSION.mount("http://", _adapter)
 
 # ==================== 内存持久化状态池 ====================
 RAW_CHAIN_CACHE = {}      # 缓存CBOE原始期权链 (覆盖现价±8%全链)
 CHAIN_VOL_STAMP = {}      # CDN防倒退校验戳
-FLOW_LEDGER = {}          # 增量订单流账本: {opt_sym: {"vol": float, "eff_signed_vol": float}}
+FLOW_LEDGER = {}          # 增量订单流账本: {opt_sym: {"vol": float, "signed_vol": float}}
 EMA_GEX_CACHE = {}        # 行权价级别EMA平滑缓存
 SPOT_CACHE = {}           # 实时现价缓存
 RENDER_CACHE = {}         # 前端秒读缓存
 INTRADAY_ANCHOR = {}      # 盘中主力移仓对比基准
 ALERT_COOLDOWN = {}       # 智能语音冷却锁
+SYNC_DIAGNOSTICS = {}     # 云端链路诊断透传字典 {ticker: status_str}
 AVAIL_DATES_LIST = []
 ACTIVE_AUTO_DATE = ""
 ANCHOR_TIME_STR = "开盘初始"
 LAST_UPDATE_STR = "同步中..."
 LAST_SYNC_EPOCH = time.time()
+LAST_CHAIN_SYNC_TS = 0.0
+
 CACHE_LOCK = threading.Lock()
+WORKER_LOCK = threading.Lock()
+WORKER_STARTED = False
 
 
-# ==================== 0. 启动自检：自动清理占用5000端口的旧进程 ====================
-def kill_stale_port_5000():
-    if os.name != "nt":
+# ==================== 0. 启动自检与云端/Gunicorn 安全守护线程 ====================
+def kill_stale_port_5000(port):
+    if os.name != "nt" or port != 5000:
         return
     my_pid = os.getpid()
     try:
@@ -71,7 +95,12 @@ def kill_stale_port_5000():
             if len(parts) >= 5 and "LISTENING" in parts:
                 pid = int(parts[-1])
                 if pid != my_pid and pid > 0 and pid not in killed:
-                    subprocess.run(f"taskkill /F /PID {pid}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    subprocess.run(
+                        f"taskkill /F /PID {pid}",
+                        shell=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
                     killed.add(pid)
         if killed:
             print(f"🧹 已自动清理后台残留旧进程 PID: {killed}")
@@ -80,7 +109,21 @@ def kill_stale_port_5000():
         pass
 
 
+def ensure_worker_started():
+    """兼容 python 直接启动与 Render Gunicorn 多进程 fork 启动"""
+    global WORKER_STARTED
+    if WORKER_STARTED:
+        return
+    with WORKER_LOCK:
+        if not WORKER_STARTED:
+            t = threading.Thread(target=background_sync_worker, daemon=True)
+            t.start()
+            WORKER_STARTED = True
+
+
 def get_us_eastern_now():
+    if NY_TZ is not None:
+        return datetime.now(NY_TZ)
     return datetime.now(timezone.utc) - timedelta(hours=5)
 
 
@@ -107,7 +150,7 @@ def yymmdd_to_date(yymmdd_str):
     try:
         return date(2000 + int(yymmdd_str[0:2]), int(yymmdd_str[2:4]), int(yymmdd_str[4:6]))
     except Exception:
-        return date.today()
+        return get_us_eastern_now().date()
 
 
 def yymmdd_to_days_diff(yymmdd_str, today_date):
@@ -139,8 +182,11 @@ def fmt_gex_str(val):
 # ==================== 1. 双源毫秒级实时现价引擎 ====================
 def fetch_cnbc_batch_spots():
     try:
-        url = "https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol?symbols=.SPX|.XSP|SPY|QQQ&requestMethod=itv&noform=1&partnerId=2&fund=1&exthrs=1&output=json"
-        r = HTTP_SESSION.get(url, timeout=1.8)
+        url = (
+            "https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol"
+            "?symbols=.SPX|.XSP|SPY|QQQ&requestMethod=itv&noform=1&partnerId=2&fund=1&exthrs=1&output=json"
+        )
+        r = HTTP_SESSION.get(url, timeout=(2.5, 4.0))
         if r.status_code == 200:
             quotes = r.json().get("FormattedQuoteResult", {}).get("FormattedQuote", [])
             cnbc_map = {".SPX": "SPX", ".XSP": "XSP", "SPY": "SPY", "QQQ": "QQQ"}
@@ -165,7 +211,7 @@ def fetch_cnbc_batch_spots():
 def fetch_single_yf_spot(key, yf_sym):
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yf_sym}?interval=1m&range=1d"
-        r = HTTP_SESSION.get(url, timeout=2.0)
+        r = HTTP_SESSION.get(url, timeout=(2.5, 4.0))
         if r.status_code == 200:
             meta = r.json()["chart"]["result"][0]["meta"]
             price = float(meta.get("regularMarketPrice") or meta.get("previousClose") or 0)
@@ -181,7 +227,7 @@ def fetch_single_yf_spot(key, yf_sym):
 def update_all_spots():
     ok = fetch_cnbc_batch_spots()
     if not ok or len(SPOT_CACHE) < 4:
-        with ThreadPoolExecutor(max_workers=4) as ex:
+        with ThreadPoolExecutor(max_workers=2) as ex:
             futures = [ex.submit(fetch_single_yf_spot, k, cfg["yf"]) for k, cfg in TICKERS.items()]
             for f in futures:
                 k, price, pct = f.result()
@@ -212,27 +258,35 @@ def bs_live_gamma(spot, strike, iv, t_years):
         return 0.0
 
 
-# ==================== 3. CBOE 全链拉取 (覆盖 ±8% 全景行权价) ====================
+# ==================== 3. CBOE 全链拉取 (云端防拦截 + 宽容超时 + 诊断透传) ====================
 def fetch_cboe_raw_chain(ticker_key):
     cfg = TICKERS[ticker_key]
     cboe_sym = cfg["cboe"]
-    ts_bucket = int(time.time() // 5)
+    # 移除 ?_={ts_bucket} 强制缓存穿透，避免 Render 共享出口 IP 触发 CBOE WAF 403/429
     urls = [
-        f"https://cdn.cboe.com/api/global/delayed_quotes/options/{cboe_sym}.json?_={ts_bucket}",
-        f"https://cdn.cboe.com/api/global/delayed_quotes/options/{cboe_sym.replace('_', '')}.json?_={ts_bucket}",
+        f"https://cdn.cboe.com/api/global/delayed_quotes/options/{cboe_sym}.json",
+        f"https://cdn.cboe.com/api/global/delayed_quotes/options/{cboe_sym.replace('_', '')}.json",
     ]
 
     raw_json = None
+    last_err = "未知网络错误"
     for url in urls:
         try:
-            r = HTTP_SESSION.get(url, timeout=(2.0, 4.0))
+            # 适配 Render 低配容器与 OPEX 日超大 JSON (15~25MB)
+            r = HTTP_SESSION.get(url, timeout=(5.0, 18.0))
             if r.status_code == 200:
                 raw_json = r.json()
                 break
-        except Exception:
-            continue
+            else:
+                last_err = f"HTTP {r.status_code}"
+        except requests.exceptions.Timeout:
+            last_err = "读取超时(Timeout)"
+        except Exception as e:
+            last_err = type(e).__name__
 
     if not raw_json or "data" not in raw_json:
+        SYNC_DIAGNOSTICS[ticker_key] = f"CBOE拉取失败({last_err})"
+        print(f"[Cloud Sync Error] {ticker_key} -> {last_err}")
         return False
 
     data_block = raw_json["data"]
@@ -242,10 +296,12 @@ def fetch_cboe_raw_chain(ticker_key):
 
     spot = SPOT_CACHE.get(ticker_key, {}).get("spot") or cboe_spot
     if spot <= 0:
+        SYNC_DIAGNOSTICS[ticker_key] = "现价异常(0)"
         return False
 
     options = data_block.get("options", [])
     if not options:
+        SYNC_DIAGNOSTICS[ticker_key] = "CBOE返回空期权链"
         return False
 
     est_now = get_us_eastern_now()
@@ -277,13 +333,28 @@ def fetch_cboe_raw_chain(ticker_key):
         vol = float(opt.get("volume", 0) or 0)
         total_chain_vol += vol
         avail_dates.add(yymmdd)
-        filtered_opts.append((sym, yymmdd, opt_type, strike, opt))
+        # 仅保留计算所需的精简字段，大幅降低 Render 512MB RAM 内存占用
+        slim_opt = {
+            "open_interest": opt.get("open_interest", 0),
+            "volume": vol,
+            "iv": opt.get("iv", 0),
+            "gamma": opt.get("gamma", 0),
+            "bid": opt.get("bid", 0),
+            "ask": opt.get("ask", 0),
+            "last_trade_price": opt.get("last_trade_price", 0),
+        }
+        filtered_opts.append((sym, yymmdd, opt_type, strike, slim_opt))
+
+    # 尽快释放巨大的原始 JSON 引用
+    del raw_json, data_block, options
 
     if not avail_dates:
+        SYNC_DIAGNOSTICS[ticker_key] = f"无有效到期日(>={today_yymmdd})"
         return False
 
     prev_max_vol = CHAIN_VOL_STAMP.get(ticker_key, 0.0)
     if total_chain_vol < prev_max_vol * 0.998 and ticker_key in RAW_CHAIN_CACHE:
+        SYNC_DIAGNOSTICS[ticker_key] = "OK(缓存保鲜)"
         return True
     CHAIN_VOL_STAMP[ticker_key] = max(prev_max_vol, total_chain_vol)
 
@@ -298,47 +369,39 @@ def fetch_cboe_raw_chain(ticker_key):
         "avail_dates": sorted_dates,
         "week_opts": week_opts,
     }
+    SYNC_DIAGNOSTICS[ticker_key] = f"OK({len(week_opts)}合约)"
     return True
 
 
 # ==================== 4. 严格盘口边界校验 + 结构极性保护订单流引擎 ====================
 def calc_calibrated_flow_polarity(opt_type, strike, spot, opt):
     """
-    Carbon 校准版订单流极性算法 (彻底解决盘中 0DTE last_p > ask 导致的全屏变紫 Bug)：
-    1. 严格盘口内校验 (In-Spread Validation): 仅当 bid <= last_p <= ask 时才计算盘口主动倾向；
-       若因 Theta 衰减或异步快照导致 last_p 越界，自动锚定结构极性 (Call=+1.0, Put=-1.0)。
-    2. Call 期权正极性保护: Call 的基础结构极性为正 (+GEX)，盘口卖压强化至 +1.25，买压适度缓冲至 +0.65，
-       确保现价上方的巨量 Call 成交 (如 SPY 737/738/740) 永远正确呈现为亮黄/绿正 Gamma 阻力墙！
-    3. Put 期权底部铁底识别: Put 基础极性为负 (-GEX)，但在关键支撑位若出现主动砸向 Bid 的卖 Put 抄底/平仓止盈
-       (ask_pos <= 0.38)，极性翻正为 +0.75 (+GEX 黄色护盘铁底，精准复刻 StrikeGEX 7300/727 效果)！
+    Carbon 校准版订单流极性算法：
+    1. 严格盘口内校验 (bid <= last_p <= ask)，屏蔽 0DTE 异步滞后报价导致的全屏翻紫 Bug。
+    2. Call 期权正极性保护，确保上方巨量 Call 墙正确呈现为黄/绿正 Gamma (+GEX)。
+    3. Put 期权底部卖盘铁底识别：当客户对着 Bid 主动卖出/平仓 Put 时翻正为黄色护盘铁底。
     """
     bid = float(opt.get("bid", 0) or 0)
     ask = float(opt.get("ask", 0) or 0)
     last_p = float(opt.get("last_trade_price", 0) or 0)
     spread = ask - bid
 
-    # 检验成交价是否真实位于当前有效买卖价差内 (允许 5% 极小容差)
     valid_in_spread = (bid > 0 and spread > 0.005 and (bid - 0.05 * spread) <= last_p <= (ask + 0.05 * spread))
 
     if opt_type == "C":
         if not valid_in_spread:
-            return 0.90  # 越界/异步快照时，Call 严格保持正 Gamma (+GEX)
+            return 0.90
         ask_pos = max(0.0, min(1.0, (last_p - bid) / spread))
-        # Call 始终保持正极性 [+0.60, +1.25]，Bid端卖出Call强化做市商Long Gamma护盘
         return 1.25 - 0.65 * ask_pos
     else:
-        # Put 极性判定
         if not valid_in_spread:
-            return -0.85  # 越界/异步快照时，Put 严格保持负 Gamma (-GEX)
+            return -0.85
         ask_pos = max(0.0, min(1.0, (last_p - bid) / spread))
         if ask_pos <= 0.36:
-            # 客户对着 Bid 主动大举卖出 Put (抄底收租或平仓止盈) -> 做市商被动接盘 Long Put (+GEX 黄色铁底!)
             return 0.85 * (1.0 - ask_pos / 0.36) + 0.25
         elif ask_pos >= 0.60:
-            # 客户对着 Ask 主动扫货买入 Put -> 做市商 Short Put (-GEX 紫色加速雷区!)
             return -0.90 - 0.45 * ((ask_pos - 0.60) / 0.40)
         else:
-            # 盘口均衡区保持标准温和负 Gamma
             return -0.75
 
 
@@ -410,10 +473,6 @@ def resolve_active_dates(avail_dates, est_now):
 
 
 def extract_full_chain_nodes(all_strikes, gex_map, spot, step):
-    """
-    全链全局关键节点提取器：
-    扫描整条期权链的全部行权价（绝不局限于当前可见行），确保 Call Wall / Put Wall / MAX +GEX 永远真实准确！
-    """
     pos_s = [s for s in all_strikes if gex_map.get(s, 0.0) > 1e-5]
     neg_s = [s for s in all_strikes if gex_map.get(s, 0.0) < -1e-5]
     center_s = round(round(spot / step) * step, 2)
@@ -427,7 +486,6 @@ def extract_full_chain_nodes(all_strikes, gex_map, spot, step):
     max_abs = max((abs(gex_map.get(s, 0.0)) for s in all_strikes), default=1.0) or 1.0
     total_net = sum(gex_map.get(s, 0.0) for s in all_strikes)
 
-    # 在现价附近寻找正负 Gamma 真实翻转轴 (Zero Flip)
     sorted_desc = sorted(all_strikes, reverse=True)
     flip = center_s
     min_dist = 1e9
@@ -733,10 +791,9 @@ def compute_ticker_gex(ticker_key, use_ema=True):
                 bw["put_vol"] += int(vol)
 
     center_strike = round(round(spot / step) * step, 2)
-    # 构建全链行权价集合 (覆盖 ±45 档全景，确保任何远端正/负 Gamma 极值墙都纳入全局计算)
     full_chain_strikes = sorted(
         set(day_buckets.keys()) | set(week_buckets.keys()) | {round(center_strike + i * step, 2) for i in range(45, -46, -1)},
-        reverse=True
+        reverse=True,
     )
 
     day_gex_map = {}
@@ -760,7 +817,6 @@ def compute_ticker_gex(ticker_key, use_ema=True):
             week_gex_map[s] = raw_w
         EMA_GEX_CACHE[ema_w_key] = week_gex_map[s]
 
-    # ✅ 核心突破：在【全链范围 (full_chain_strikes)】提取 Call Wall / Put Wall / MAX +GEX，绝不被显示行数截断！
     day_meta = extract_full_chain_nodes(full_chain_strikes, day_gex_map, spot, step)
     week_meta = extract_full_chain_nodes(full_chain_strikes, week_gex_map, spot, step)
 
@@ -772,11 +828,9 @@ def compute_ticker_gex(ticker_key, use_ema=True):
     active_map = week_gex_map if WEEKLY_MODE else day_gex_map
     active_meta = week_meta if WEEKLY_MODE else day_meta
 
-    # 根据用户选择的视野宽度 (默认 ±15 档，可切 ±25 / ±45) 生成显示列表
     visible_strikes = [round(center_strike + i * step, 2) for i in range(STRIKE_SPAN, -STRIKE_SPAN - 1, -1)]
     pinned_set = set()
 
-    # 📌 远端极值墙自动钉住：若全链 Call Wall 或 Put Wall 超出当前视野，自动钉在最顶/最底行！
     if active_meta["cw"] not in visible_strikes:
         if active_meta["cw"] > visible_strikes[0]:
             visible_strikes.insert(0, active_meta["cw"])
@@ -873,27 +927,51 @@ def rebuild_render_cache(use_ema=True):
 
 
 def background_sync_worker():
+    """双速解耦后台守护线程：5秒高频刷现价 + 20秒低并发拉全链 + GC 防内存溢出"""
+    global LAST_CHAIN_SYNC_TS
     while True:
         try:
+            # 1. 每 5 秒极速更新四大标的实时现价
             update_all_spots()
-            with ThreadPoolExecutor(max_workers=4) as ex:
-                list(ex.map(fetch_cboe_raw_chain, ["SPX", "XSP", "SPY", "QQQ"]))
+
+            # 2. 首次启动立即拉取，或每 20 秒低并发更新 CBOE 全链 (max_workers=2 保护云端 RAM)
+            now_t = time.time()
+            need_chain = (len(RAW_CHAIN_CACHE) < 4) or (now_t - LAST_CHAIN_SYNC_TS >= CHAIN_SYNC_INTERVAL)
+            if need_chain:
+                with ThreadPoolExecutor(max_workers=CHAIN_MAX_WORKERS) as ex:
+                    list(ex.map(fetch_cboe_raw_chain, ["SPX", "XSP", "SPY", "QQQ"]))
+                LAST_CHAIN_SYNC_TS = time.time()
+                gc.collect()
+
+            # 3. 结合最新现价动态重算 BS-Gamma 并刷新前端内存缓存
             rebuild_render_cache(use_ema=True)
         except Exception as e:
             print("Background sync warning:", e)
-        time.sleep(4.5)
+        time.sleep(SPOT_SYNC_INTERVAL)
 
 
-# ==================== 8. Flask 极速路由 ====================
+# ==================== 8. Flask 极速路由 & 云端健康检查 ====================
+@app.route("/health")
+def health():
+    ensure_worker_started()
+    with CACHE_LOCK:
+        ready_cnt = len(RENDER_CACHE)
+        diag_copy = dict(SYNC_DIAGNOSTICS)
+    return jsonify({"status": "ok", "loaded_tickers": ready_cnt, "diagnostics": diag_copy})
+
+
 @app.route("/api/gex")
 def api_gex():
+    ensure_worker_started()
     with CACHE_LOCK:
         data_copy = dict(RENDER_CACHE)
         ts = LAST_UPDATE_STR
         avail_copy = list(AVAIL_DATES_LIST)
         auto_d = ACTIVE_AUTO_DATE
         anchor_ts = ANCHOR_TIME_STR
-        next_in = max(0, round(4.5 - (time.time() - LAST_SYNC_EPOCH), 1))
+        diag_copy = dict(SYNC_DIAGNOSTICS)
+        next_in = max(0.0, round(SPOT_SYNC_INTERVAL - (time.time() - LAST_SYNC_EPOCH), 1))
+        chain_age = int(max(0, time.time() - LAST_CHAIN_SYNC_TS)) if LAST_CHAIN_SYNC_TS > 0 else -1
 
     all_alerts = []
     for k, v in data_copy.items():
@@ -902,6 +980,7 @@ def api_gex():
     return jsonify({
         "timestamp": ts,
         "next_in": next_in,
+        "chain_age": chain_age,
         "anchor_time": anchor_ts,
         "ready": len(data_copy) > 0,
         "selected_exp": SELECTED_EXP,
@@ -911,6 +990,7 @@ def api_gex():
         "live_flow_mode": LIVE_FLOW_MODE,
         "noise_reduction": NOISE_REDUCTION,
         "strike_span": STRIKE_SPAN,
+        "diagnostics": diag_copy,
         "data": data_copy,
         "alerts": all_alerts,
     })
@@ -974,14 +1054,14 @@ def toggle_noise():
     return jsonify({"status": "ok", "noise_reduction": NOISE_REDUCTION})
 
 
-# ==================== 9. 前端可视化指挥舱 (支持全链视野切换 + 远端墙钉住) ====================
+# ==================== 9. 前端可视化指挥舱 (支持诊断透传 + 全链视野切换) ====================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>GEX 实时量化指挥舱 (Carbon 全链全景版)</title>
+<title>GEX 实时量化指挥舱 (Carbon 云端防拦截高精版)</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -1076,6 +1156,17 @@ HTML_TEMPLATE = """
     color: #fff;
     border-color: #38bdf8;
   }
+  .diag-bar {
+    display: none;
+    background: rgba(120, 53, 15, 0.35);
+    border: 1px solid #d97706;
+    color: #fcd34d;
+    padding: 5px 12px;
+    border-radius: 6px;
+    margin-bottom: 8px;
+    font-size: 11px;
+    font-weight: 700;
+  }
   .grid-container {
     display: grid;
     grid-template-columns: repeat(4, 1fr);
@@ -1139,7 +1230,6 @@ HTML_TEMPLATE = """
     padding: 2px 6px;
     border-radius: 4px;
   }
-
   .tactical-hud {
     font-size: 11px;
     font-weight: 700;
@@ -1149,7 +1239,6 @@ HTML_TEMPLATE = """
     border-left: 3px solid #38bdf8;
     line-height: 1.35;
   }
-
   .ladder-body {
     display: flex;
     flex-direction: column;
@@ -1222,6 +1311,7 @@ HTML_TEMPLATE = """
     color: #94a3b8;
     font-size: 15px;
     font-weight: 700;
+    line-height: 1.8;
   }
   #tooltip {
     position: fixed;
@@ -1273,6 +1363,7 @@ HTML_TEMPLATE = """
   </div>
 </div>
 
+<div id="diagBar" class="diag-bar"></div>
 <div id="alertBox" class="alert-banner">
   <span id="alertText"></span>
   <span style="cursor:pointer; padding:0 6px;" onclick="document.getElementById('alertBox').style.display='none'">✖</span>
@@ -1401,7 +1492,8 @@ async function fetchGexData(force = false) {
     const json = await res.json();
 
     document.getElementById("clockTag").innerText = `LIVE ${json.timestamp}`;
-    document.getElementById("nextTag").innerText = `Next: ${json.next_in}s`;
+    const chainTag = json.chain_age >= 0 ? ` | 全链 ${json.chain_age}s前` : "";
+    document.getElementById("nextTag").innerText = `Next: ${json.next_in}s${chainTag}`;
 
     const sel = document.getElementById("dateSelect");
     if (json.avail_dates && json.avail_dates.length > 0) {
@@ -1432,10 +1524,32 @@ async function fetchGexData(force = false) {
     noiseBtn.innerText = json.noise_reduction ? "🧹 降噪: ON" : "🧹 降噪: OFF";
     noiseBtn.className = json.noise_reduction ? "btn active-sub" : "btn";
 
-    if (!json.ready) return;
+    // 云端链路诊断透传：未就绪时在中间提示，部分失败时在顶部黄条提示
+    const diagBar = document.getElementById("diagBar");
+    const diagEntries = json.diagnostics ? Object.entries(json.diagnostics) : [];
+    const errEntries = diagEntries.filter(([k, v]) => !String(v).startsWith("OK"));
+
+    if (!json.ready) {
+      if (diagEntries.length > 0) {
+        const diagText = diagEntries.map(([k, v]) => `${k}: ${v}`).join(" | ");
+        document.getElementById("grid").innerHTML = `
+          <div class="loading-box">
+            ⚡ 正在同步全链数据 (双速解耦模式)...<br>
+            <span style="font-size:12px; color:#f59e0b; margin-top:8px; display:inline-block;">云端链路诊断: ${diagText}</span>
+          </div>`;
+      }
+      return;
+    }
+
+    if (errEntries.length > 0) {
+      diagBar.style.display = "block";
+      diagBar.innerText = "⚠️ 部分标的拉取异常 (已自动保留旧缓存快照): " + errEntries.map(([k, v]) => `${k}=${v}`).join(" | ");
+    } else {
+      diagBar.style.display = "none";
+    }
+
     latestDataMap = json.data || {};
 
-    // 保存各列滚动条位置，防止刷新时跳回顶部
     const scrollPositions = {};
     document.querySelectorAll(".ladder-body").forEach(el => {
       const sym = el.getAttribute("data-sym");
@@ -1533,7 +1647,6 @@ async function fetchGexData(force = false) {
 
     if (html) {
       document.getElementById("grid").innerHTML = html;
-      // 恢复滚动条位置
       document.querySelectorAll(".ladder-body").forEach(el => {
         const sym = el.getAttribute("data-sym");
         if (sym && scrollPositions[sym] !== undefined) {
@@ -1561,15 +1674,16 @@ setInterval(fetchGexData, 2000);
 
 @app.route("/")
 def index():
+    ensure_worker_started()
     return render_template_string(HTML_TEMPLATE)
 
 
 if __name__ == "__main__":
-    kill_stale_port_5000()
-    t = threading.Thread(target=background_sync_worker, daemon=True)
-    t.start()
+    port = int(os.environ.get("PORT", 5000))
+    kill_stale_port_5000(port)
+    ensure_worker_started()
     print("=========================================================")
-    print("🚀 XSP/SPX GEX 指挥中心 (Carbon 全链全景 + 盘口边界校准版) 已启动")
-    print("👉 请在浏览器打开: http://127.0.0.1:5000")
+    print(f"🚀 XSP/SPX GEX 指挥中心 (Carbon 云端防拦截双速解耦版) 已启动 (Port {port})")
+    print(f"👉 本地访问: http://127.0.0.1:{port}")
     print("=========================================================")
-    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
