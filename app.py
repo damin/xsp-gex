@@ -34,7 +34,7 @@ CHAIN_MAX_WORKERS = 2      # 限制全链并发为 2，防止 OPEX 日同时解�
 
 # 趋势曲线与单档显著异动参数
 NET_HISTORY_SAMPLE_SEC = 10.0  # 全链净值趋势图每10秒采样1个点
-NET_HISTORY_MAX_POINTS = 180   # 最多保留180个点 (约30分钟连续走势)
+NET_HISTORY_MAX_POINTS = 360   # 最多保留360个点 (约60分钟连续走势，支持高清放大回看)
 DELTA_LOOKBACK_SEC = 60.0      # 单档异动回看窗口 (60秒滚动净变化，兼顾EMA平滑与CBOE CDN缓存周期)
 DELTA_REL_RATIO = 0.035        # 动态相对阈值: 变化量 >= 本列最大单档绝对值的 3.5%
 
@@ -510,9 +510,9 @@ def extract_full_chain_nodes(all_strikes, gex_map, spot, step):
     }
 
 
-# ==================== 5.5 全链净值走势采样 & 单档滚动异动引擎 ====================
+# ==================== 5.5 全链净值与指数走势双轴采样 & 单档滚动异动引擎 ====================
 def record_and_get_net_history(ticker_key, target_d, mode_tag, total_net, spot, est_now, record_sample=True):
-    """按 (标的, 目标日期, 视图模式, 流向模式) 独立记录全链净值时间序列，供前端绘制走势曲线"""
+    """按 (标的, 目标日期, 视图模式, 流向模式) 独立记录全链净值与各自指数现价序列，供前端绘制双轴对比与放大图"""
     hist_key = (ticker_key, target_d, mode_tag, LIVE_FLOW_MODE, NOISE_REDUCTION)
     dq = NET_GEX_HISTORY.get(hist_key)
     if dq is None:
@@ -526,27 +526,34 @@ def record_and_get_net_history(ticker_key, target_d, mode_tag, total_net, spot, 
         if not dq or (now_ts - dq[-1][0] >= NET_HISTORY_SAMPLE_SEC):
             dq.append((now_ts, hm_str, round(total_net, 4), round(spot, 2)))
         else:
-            # 10秒采样间隔内实时刷新末端点，保证最新数值与曲线末端无缝贴合
+            # 10秒采样间隔内实时刷新末端点，保证最新数值与现价曲线末端无缝贴合
             dq[-1] = (dq[-1][0], hm_str, round(total_net, 4), round(spot, 2))
     elif not dq:
         dq.append((now_ts, hm_str, round(total_net, 4), round(spot, 2)))
 
-    # 限制前端传输点数 <= 90 (轻量 JSON)，超过则等距抽稀保留首尾
+    # 限制前端传输点数 <= 180 (兼顾卡片缩略图与高清放大视图，超过则等距抽稀保留首尾)
     pts = list(dq)
-    if len(pts) > 90:
-        step_idx = len(pts) / 90.0
-        sampled = [pts[int(i * step_idx)] for i in range(89)]
+    if len(pts) > 180:
+        step_idx = len(pts) / 180.0
+        sampled = [pts[int(i * step_idx)] for i in range(179)]
         sampled.append(pts[-1])
         pts = sampled
 
     start_val = pts[0][2] if pts else total_net
     trend_delta = total_net - start_val
+    valid_spots = [p[3] for p in pts if p[3] and p[3] > 0]
+    start_spot = valid_spots[0] if valid_spots else round(spot, 2)
+    spot_delta = (spot - start_spot) if start_spot > 0 else 0.0
+    spot_delta_pct = (spot_delta / start_spot * 100.0) if start_spot > 0 else 0.0
     span_mins = max(0, int((pts[-1][0] - pts[0][0]) / 60.0)) if len(pts) >= 2 else 0
 
     return {
         "points": [{"t": p[1], "v": p[2], "p": p[3]} for p in pts],
         "start_val": round(start_val, 4),
         "trend_delta": round(trend_delta, 4),
+        "start_spot": round(start_spot, 2),
+        "spot_delta": round(spot_delta, 2),
+        "spot_delta_pct": round(spot_delta_pct, 3),
         "span_mins": span_mins,
     }
 
@@ -921,7 +928,7 @@ def compute_ticker_gex(ticker_key, use_ema=True):
     day_meta = extract_full_chain_nodes(full_chain_strikes, day_gex_map, spot, step)
     week_meta = extract_full_chain_nodes(full_chain_strikes, week_gex_map, spot, step)
 
-    # 双周期同时记录全链净值趋势，确保切换 日/周 模式时历史曲线无缝衔接
+    # 双周期同时记录全链净值与指数走势，确保切换 日/周 模式时历史曲线无缝衔接
     day_hist = record_and_get_net_history(ticker_key, target_d, "DAY", day_meta["total_net"], spot, est_now, record_sample=use_ema)
     week_hist = record_and_get_net_history(ticker_key, target_d, "WEEK", week_meta["total_net"], spot, est_now, record_sample=use_ema)
 
@@ -1167,14 +1174,14 @@ def toggle_noise():
     return jsonify({"status": "ok", "noise_reduction": NOISE_REDUCTION})
 
 
-# ==================== 9. 前端可视化指挥舱 (含全链净值趋势图 + 行内显著异动中栏) ====================
+# ==================== 9. 前端可视化指挥舱 (双轴叠加指数参考线 + 单图独立放大视图) ====================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>GEX 实时量化指挥舱 (Carbon 趋势曲线 + 异动脉冲版)</title>
+<title>GEX 实时量化指挥舱 (双轴指数叠加 + 独立放大版)</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -1346,18 +1353,25 @@ HTML_TEMPLATE = """
     border-radius: 4px;
   }
 
-  /* 全链净值走势面板 */
+  /* 全链净值 + 指数现价双轴叠加走势面板 */
   .net-trend-box {
-    background: rgba(10, 14, 26, 0.88);
+    background: rgba(10, 14, 26, 0.92);
     border: 1px solid #24304a;
     border-radius: 6px;
     padding: 5px 8px 4px 8px;
     margin-bottom: 6px;
+    cursor: zoom-in;
+    transition: border-color 0.15s, box-shadow 0.15s;
+    position: relative;
+  }
+  .net-trend-box:hover {
+    border-color: #38bdf8;
+    box-shadow: 0 0 10px rgba(56, 189, 248, 0.18);
   }
   .net-trend-top {
     display: flex;
     justify-content: space-between;
-    align-items: baseline;
+    align-items: center;
     margin-bottom: 3px;
     gap: 4px;
   }
@@ -1366,14 +1380,67 @@ HTML_TEMPLATE = """
     font-weight: 800;
     letter-spacing: -0.2px;
   }
+  .net-top-right {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+  }
   .net-val-delta {
     font-size: 10px;
     font-weight: 700;
     white-space: nowrap;
   }
+  .zoom-btn-mini {
+    background: rgba(30, 41, 59, 0.9);
+    border: 1px solid #334155;
+    color: #cbd5e1;
+    border-radius: 4px;
+    padding: 1px 5px;
+    font-size: 10px;
+    font-weight: 700;
+    cursor: pointer;
+    line-height: 1.3;
+    transition: all 0.12s;
+  }
+  .net-trend-box:hover .zoom-btn-mini {
+    border-color: #38bdf8;
+    color: #38bdf8;
+    background: rgba(15, 23, 42, 0.95);
+  }
+  .spark-legend-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 9.5px;
+    margin-bottom: 2px;
+    color: #94a3b8;
+  }
+  .legend-items {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .legend-dot-gex {
+    display: inline-block;
+    width: 8px;
+    height: 3px;
+    border-radius: 2px;
+    background: #34d399;
+    vertical-align: middle;
+    margin-right: 3px;
+  }
+  .legend-dot-spot {
+    display: inline-block;
+    width: 9px;
+    height: 2px;
+    background: #fbbf24;
+    vertical-align: middle;
+    margin-right: 3px;
+    box-shadow: 0 0 4px rgba(251, 191, 36, 0.7);
+  }
   .spark-wrap {
     width: 100%;
-    height: 30px;
+    height: 44px;
     position: relative;
   }
   .spark-meta {
@@ -1381,7 +1448,9 @@ HTML_TEMPLATE = """
     justify-content: space-between;
     font-size: 9px;
     color: #64748b;
-    margin-top: 1px;
+    margin-top: 2px;
+    gap: 4px;
+    white-space: nowrap;
   }
 
   .tactical-hud {
@@ -1396,7 +1465,7 @@ HTML_TEMPLATE = """
   .ladder-body {
     display: flex;
     flex-direction: column;
-    max-height: 70vh;
+    max-height: 68vh;
     overflow-y: auto;
     scrollbar-width: thin;
     scrollbar-color: #334155 #0f172a;
@@ -1440,7 +1509,7 @@ HTML_TEMPLATE = """
     text-align: right;
     white-space: nowrap;
   }
-  /* 行内显著变化胶囊 (在亮黄与深紫背景上均高对比可读) */
+  /* 行内显著变化胶囊 */
   .delta-badge {
     font-size: 10px;
     font-weight: 800;
@@ -1523,7 +1592,7 @@ HTML_TEMPLATE = """
     z-index: 9999;
     pointer-events: none;
     box-shadow: 0 8px 24px rgba(0,0,0,0.75);
-    max-width: 330px;
+    max-width: 340px;
   }
   .alert-banner {
     display: none;
@@ -1537,6 +1606,171 @@ HTML_TEMPLATE = """
     margin-bottom: 8px;
     font-size: 13px;
     font-weight: 700;
+  }
+
+  /* ==================== 独立放大走势图模态框 ==================== */
+  .chart-modal-mask {
+    position: fixed;
+    inset: 0;
+    background: rgba(5, 8, 16, 0.84);
+    backdrop-filter: blur(5px);
+    z-index: 9500;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+  }
+  .chart-modal-mask.open {
+    display: flex;
+  }
+  .chart-modal-card {
+    width: min(1120px, 96vw);
+    background: #111624;
+    border: 1px solid #334155;
+    border-radius: 12px;
+    box-shadow: 0 22px 60px rgba(0, 0, 0, 0.85);
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+  .modal-header {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px 16px;
+    background: #161d2f;
+    border-bottom: 1px solid #262f45;
+    gap: 10px;
+  }
+  .modal-title-group {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .modal-sym-tabs {
+    display: flex;
+    gap: 5px;
+  }
+  .sym-tab {
+    background: #0f172a;
+    border: 1px solid #334155;
+    color: #94a3b8;
+    font-size: 12px;
+    font-weight: 800;
+    padding: 4px 11px;
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 0.12s;
+  }
+  .sym-tab:hover { color: #f8fafc; border-color: #64748b; }
+  .sym-tab.active {
+    background: #0284c7;
+    color: #ffffff;
+    border-color: #38bdf8;
+    box-shadow: 0 0 10px rgba(56, 189, 248, 0.35);
+  }
+  .modal-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .layer-toggle {
+    background: #0f172a;
+    border: 1px solid #334155;
+    color: #cbd5e1;
+    font-size: 11px;
+    font-weight: 700;
+    padding: 4px 9px;
+    border-radius: 5px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .layer-toggle.on-gex {
+    border-color: #10b981;
+    color: #34d399;
+    background: rgba(6, 78, 59, 0.35);
+  }
+  .layer-toggle.on-spot {
+    border-color: #f59e0b;
+    color: #fbbf24;
+    background: rgba(120, 53, 15, 0.35);
+  }
+  .modal-close-btn {
+    background: #1e293b;
+    border: 1px solid #475569;
+    color: #f8fafc;
+    font-size: 12px;
+    font-weight: 800;
+    padding: 4px 11px;
+    border-radius: 5px;
+    cursor: pointer;
+  }
+  .modal-close-btn:hover { background: #dc2626; border-color: #f87171; }
+  .modal-kpi-strip {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 8px;
+    padding: 10px 16px;
+    background: #0e1320;
+    border-bottom: 1px solid #1e293b;
+  }
+  @media (max-width: 760px) {
+    .modal-kpi-strip { grid-template-columns: repeat(2, 1fr); }
+  }
+  .kpi-box {
+    background: #151c2e;
+    border: 1px solid #24304a;
+    border-radius: 6px;
+    padding: 7px 10px;
+  }
+  .kpi-lbl {
+    font-size: 10px;
+    color: #94a3b8;
+    margin-bottom: 2px;
+    font-weight: 600;
+  }
+  .kpi-val {
+    font-size: 14px;
+    font-weight: 800;
+  }
+  .modal-readout-bar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 8px 16px;
+    background: rgba(15, 23, 42, 0.9);
+    border-bottom: 1px solid #1e293b;
+    font-size: 12px;
+    font-weight: 700;
+  }
+  .modal-chart-stage {
+    padding: 12px 16px 14px 16px;
+    background: #0b0e17;
+    position: relative;
+  }
+  .modal-svg-container {
+    width: 100%;
+    height: min(430px, 54vh);
+    min-height: 280px;
+    position: relative;
+    cursor: crosshair;
+  }
+  .modal-footer-bar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 8px 16px;
+    background: #131826;
+    border-top: 1px solid #262f45;
+    font-size: 11px;
+    color: #94a3b8;
   }
 </style>
 </head>
@@ -1556,6 +1790,7 @@ HTML_TEMPLATE = """
     <button id="weekBtn" class="btn active-day" onclick="toggleMode('/api/toggle_weekly')">📅 周期: 单日 (DAY)</button>
     <button id="flowBtn" class="btn active-flow" onclick="toggleMode('/api/toggle_flow')">⚡ LIVE FLOW: ON (盘口动态)</button>
     <button id="noiseBtn" class="btn active-sub" onclick="toggleMode('/api/toggle_noise')">🧹 降噪: ON</button>
+    <button id="spotLineBtn" class="btn active-flow" onclick="toggleInlineSpotLine()" title="在卡片走势图中显示/隐藏指数现价参考线">📈 指数叠加: ON</button>
     <button id="anchorBtn" class="btn" onclick="resetAnchor()" title="以当前时刻重新锚定盘中主力移仓对比基准">⚓ 重置移仓锚点</button>
     <button id="soundBtn" class="btn" onclick="toggleSound()">🔊 语音: OFF</button>
   </div>
@@ -1567,9 +1802,37 @@ HTML_TEMPLATE = """
   <span style="cursor:pointer; padding:0 6px;" onclick="document.getElementById('alertBox').style.display='none'">✖</span>
 </div>
 <div id="grid" class="grid-container">
-  <div class="loading-box">⚡ 正在扫描全链 GEX 走势曲线与单档显著异动脉冲...</div>
+  <div class="loading-box">⚡ 正在扫描全链 GEX 与指数现价双轴走势曲线...</div>
 </div>
 <div id="tooltip"></div>
+
+<!-- 单图独立放大观察模态框 -->
+<div id="chartModal" class="chart-modal-mask" onclick="onModalMaskClick(event)">
+  <div class="chart-modal-card" onclick="event.stopPropagation()">
+    <div class="modal-header">
+      <div class="modal-title-group">
+        <div class="modal-sym-tabs" id="modalSymTabs"></div>
+        <span id="modalExpLabel" style="font-size:13px; font-weight:800; color:#e2e8f0;"></span>
+      </div>
+      <div class="modal-actions">
+        <button id="modalToggleGex" class="layer-toggle on-gex" onclick="toggleModalLayer('gex')">✔ 全链净 GEX (左轴)</button>
+        <button id="modalToggleSpot" class="layer-toggle on-spot" onclick="toggleModalLayer('spot')">✔ 指数现价线 (右轴)</button>
+        <button class="modal-close-btn" onclick="closeZoomModal()">✖ 关闭 (ESC)</button>
+      </div>
+    </div>
+    <div class="modal-kpi-strip" id="modalKpiStrip"></div>
+    <div class="modal-readout-bar" id="modalReadoutBar"></div>
+    <div class="modal-chart-stage">
+      <div class="modal-svg-container" id="modalSvgWrap"
+           onmousemove="onZoomChartHover(event)"
+           onmouseleave="onZoomChartLeave()"></div>
+    </div>
+    <div class="modal-footer-bar">
+      <span id="modalHudText" style="font-weight:700;"></span>
+      <span>💡 提示：移动鼠标查看逐点双轴十字光标对比，按 ← / → 键快速切换标的，每 2 秒自动同步刷新</span>
+    </div>
+  </div>
+</div>
 
 <script>
 let soundEnabled = false;
@@ -1577,6 +1840,16 @@ let isFetching = false;
 let lastSpokenAlert = "";
 let latestDataMap = {};
 let hoveredKey = null;
+let hoveredSpark = null;
+let showInlineSpot = true;
+
+// 放大视图状态
+let zoomedSym = null;
+let zoomHoverIdx = null;
+let modalShowGex = true;
+let modalShowSpot = true;
+let lastModalPlot = { W: 1000, PAD_L: 74, PAD_R: 74 };
+const TICKER_ORDER = ["SPX", "XSP", "SPY", "QQQ"];
 
 function formatGex(val) {
   const absV = Math.abs(val);
@@ -1595,62 +1868,121 @@ function formatGexCompact(val) {
   return "0";
 }
 
-function buildNetSparklineSVG(sym, netHist, currentVal) {
+function formatSpotDelta(val) {
+  const sign = val > 0 ? "+" : (val < 0 ? "-" : "");
+  return `${sign}${Math.abs(val).toFixed(2)}`;
+}
+
+// 计算双轴归一化边界 (左轴=全链净GEX，右轴=标的现价)
+function computeDualScales(pts, currentVal, currentSpot) {
+  const vals = pts.length ? pts.map(p => p.v) : [currentVal];
+  let minV = Math.min(...vals);
+  let maxV = Math.max(...vals);
+  if (minV < 0 && maxV > 0) {
+    // 已自然跨越 0 轴
+  } else if (Math.abs(minV) < (maxV - minV) * 0.5 || Math.abs(maxV) < (maxV - minV) * 0.5) {
+    minV = Math.min(minV, 0);
+    maxV = Math.max(maxV, 0);
+  }
+  let rangeV = maxV - minV;
+  if (rangeV < 1e-4) {
+    rangeV = Math.max(Math.abs(maxV) * 0.2, 0.2);
+    minV -= rangeV / 2;
+    maxV += rangeV / 2;
+  }
+
+  const validSpots = pts.map(p => (p.p && p.p > 0) ? p.p : currentSpot).filter(x => x > 0);
+  const spots = validSpots.length ? validSpots : [currentSpot || 100];
+  let minP = Math.min(...spots);
+  let maxP = Math.max(...spots);
+  let rangeP = maxP - minP;
+  const minPadP = Math.max((currentSpot || maxP) * 0.00025, 0.06);
+  if (rangeP < minPadP) {
+    const midP = (minP + maxP) / 2;
+    minP = midP - minPadP / 2;
+    maxP = midP + minPadP / 2;
+  } else {
+    minP -= rangeP * 0.06;
+    maxP += rangeP * 0.06;
+  }
+
+  return { minV, maxV, minP, maxP, spots };
+}
+
+// 判定量价配合/背离状态
+function classifyDivergence(gexDelta, spotDelta) {
+  if (Math.abs(gexDelta) < 1e-3 && Math.abs(spotDelta) < 1e-3) {
+    return { text: "⚪ 横盘蓄势", color: "#94a3b8" };
+  }
+  if (spotDelta >= 0 && gexDelta >= 0) {
+    return { text: "🟢 价升GEX增 (多头共振推升)", color: "#34d399" };
+  }
+  if (spotDelta < 0 && gexDelta > 0) {
+    return { text: "🛡️ 价跌GEX增 (逢低承接护盘)", color: "#38bdf8" };
+  }
+  if (spotDelta > 0 && gexDelta < 0) {
+    return { text: "⚠️ 价升GEX降 (拉高派发/背离)", color: "#f59e0b" };
+  }
+  return { text: "🟣 价跌GEX降 (负Gamma助跌共振)", color: "#c084fc" };
+}
+
+// 构建卡片内双轴叠加缩略图 SVG (全链净 GEX 面积曲线 + 指数现价金黄色对比线)
+function buildNetSparklineSVG(sym, netHist, currentVal, currentSpot) {
   const pts = (netHist && netHist.points) ? netHist.points : [];
-  const W = 220, H = 30, PAD_Y = 3;
+  const W = 240, H = 44, PAD_Y = 4, PAD_R = 5;
 
   if (pts.length === 0) {
     return `<svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}"><line x1="0" y1="${H/2}" x2="${W}" y2="${H/2}" stroke="#334155" stroke-dasharray="2,2"/></svg>`;
   }
 
-  const vals = pts.map(p => p.v);
-  let minV = Math.min(...vals);
-  let maxV = Math.max(...vals);
-  // 若跨越 0 轴或贴近 0 轴，把 0 纳入坐标系以便直观看到正负切换
-  if (minV < 0 && maxV > 0) {
-    // 已经跨越 0 轴
-  } else if (Math.abs(minV) < (maxV - minV) * 0.5 || Math.abs(maxV) < (maxV - minV) * 0.5) {
-    minV = Math.min(minV, 0);
-    maxV = Math.max(maxV, 0);
-  }
+  const { minV, maxV, minP, maxP, spots } = computeDualScales(pts, currentVal, currentSpot);
+  const mapY_V = (v) => PAD_Y + ((maxV - v) / (maxV - minV)) * (H - PAD_Y * 2);
+  const mapY_P = (p) => PAD_Y + ((maxP - p) / (maxP - minP)) * (H - PAD_Y * 2);
 
-  let range = maxV - minV;
-  if (range < 1e-4) {
-    range = Math.max(Math.abs(maxV) * 0.2, 0.1);
-    minV -= range / 2;
-    maxV += range / 2;
-  }
-
-  const mapY = (v) => PAD_Y + ((maxV - v) / (maxV - minV)) * (H - PAD_Y * 2);
-  const zeroY = Math.max(PAD_Y, Math.min(H - PAD_Y, mapY(0)));
+  const zeroY = Math.max(PAD_Y, Math.min(H - PAD_Y, mapY_V(0)));
   const zeroPct = Math.max(0, Math.min(100, (zeroY / H) * 100)).toFixed(1);
 
   if (pts.length === 1) {
-    const y = mapY(vals[0]).toFixed(1);
-    const col = vals[0] >= 0 ? "#34d399" : "#c084fc";
+    const yV = mapY_V(pts[0].v).toFixed(1);
+    const yP = mapY_P(spots[0]).toFixed(1);
+    const col = pts[0].v >= 0 ? "#34d399" : "#c084fc";
     return `
       <svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" preserveAspectRatio="none">
         <line x1="0" y1="${zeroY.toFixed(1)}" x2="${W}" y2="${zeroY.toFixed(1)}" stroke="#334155" stroke-width="0.8" stroke-dasharray="2,2"/>
-        <line x1="0" y1="${y}" x2="${W - 4}" y2="${y}" stroke="${col}" stroke-width="1.6" stroke-dasharray="3,2"/>
-        <circle cx="${W - 4}" cy="${y}" r="2.8" fill="${col}"/>
+        <line x1="0" y1="${yV}" x2="${W - PAD_R}" y2="${yV}" stroke="${col}" stroke-width="1.7" stroke-dasharray="3,2"/>
+        ${showInlineSpot ? `<line x1="0" y1="${yP}" x2="${W - PAD_R}" y2="${yP}" stroke="#fbbf24" stroke-width="1.3" stroke-dasharray="2,2"/>` : ""}
+        <circle cx="${W - PAD_R}" cy="${yV}" r="2.6" fill="${col}"/>
       </svg>`;
   }
 
-  const coords = pts.map((p, idx) => {
-    const x = (idx / (pts.length - 1)) * (W - 4);
-    const y = mapY(p.v);
-    return [x, y];
-  });
+  const usableW = W - PAD_R;
+  const gexCoords = pts.map((p, idx) => [
+    (idx / (pts.length - 1)) * usableW,
+    mapY_V(p.v)
+  ]);
+  const spotCoords = spots.map((sp, idx) => [
+    (idx / (spots.length - 1)) * usableW,
+    mapY_P(sp)
+  ]);
 
-  const linePoints = coords.map(c => `${c[0].toFixed(1)},${c[1].toFixed(1)}`).join(" ");
-  const lastX = coords[coords.length - 1][0].toFixed(1);
-  const lastY = coords[coords.length - 1][1].toFixed(1);
-  const areaPath = `M 0,${zeroY.toFixed(1)} L ` + coords.map(c => `${c[0].toFixed(1)},${c[1].toFixed(1)}`).join(" L ") + ` L ${lastX},${zeroY.toFixed(1)} Z`;
+  const gexLine = gexCoords.map(c => `${c[0].toFixed(1)},${c[1].toFixed(1)}`).join(" ");
+  const spotLine = spotCoords.map(c => `${c[0].toFixed(1)},${c[1].toFixed(1)}`).join(" ");
+  const lastX = gexCoords[gexCoords.length - 1][0].toFixed(1);
+  const lastYV = gexCoords[gexCoords.length - 1][1].toFixed(1);
+  const lastYP = spotCoords[spotCoords.length - 1][1].toFixed(1);
+  const areaPath = `M 0,${zeroY.toFixed(1)} L ` + gexCoords.map(c => `${c[0].toFixed(1)},${c[1].toFixed(1)}`).join(" L ") + ` L ${lastX},${zeroY.toFixed(1)} Z`;
 
   const gradStrokeId = `sg_${sym}`;
   const gradFillId = `fg_${sym}`;
   const dotColor = currentVal >= 0 ? "#34d399" : "#c084fc";
   const showZeroLine = (minV <= 0 && maxV >= 0);
+
+  // 叠加指数走势线 (带深色描边衬底以防与绿色/紫色曲线重叠混淆)
+  const spotOverlaySvg = showInlineSpot ? `
+      <polyline points="${spotLine}" fill="none" stroke="rgba(11, 14, 23, 0.85)" stroke-width="3.0" stroke-linejoin="round" stroke-linecap="round"/>
+      <polyline points="${spotLine}" fill="none" stroke="#fbbf24" stroke-width="1.45" stroke-opacity="0.95" stroke-linejoin="round" stroke-linecap="round"/>
+      <circle cx="${lastX}" cy="${lastYP}" r="2.3" fill="#fbbf24" stroke="#0b0e17" stroke-width="0.8"/>
+  ` : "";
 
   return `
     <svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" preserveAspectRatio="none">
@@ -1662,18 +1994,384 @@ function buildNetSparklineSVG(sym, netHist, currentVal) {
           <stop offset="100%" stop-color="#c084fc"/>
         </linearGradient>
         <linearGradient id="${gradFillId}" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stop-color="rgba(52, 211, 153, 0.28)"/>
+          <stop offset="${zeroPct}%" stop-color="rgba(52, 211, 153, 0.04)"/>
+          <stop offset="${zeroPct}%" stop-color="rgba(192, 132, 252, 0.04)"/>
+          <stop offset="100%" stop-color="rgba(192, 132, 252, 0.30)"/>
+        </linearGradient>
+      </defs>
+      ${showZeroLine ? `<line x1="0" y1="${zeroY.toFixed(1)}" x2="${W}" y2="${zeroY.toFixed(1)}" stroke="#475569" stroke-width="0.9" stroke-dasharray="2,2"/>` : ""}
+      <path d="${areaPath}" fill="url(#${gradFillId})"/>
+      <polyline points="${gexLine}" fill="none" stroke="url(#${gradStrokeId})" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>
+      ${spotOverlaySvg}
+      <circle cx="${lastX}" cy="${lastYV}" r="2.7" fill="${dotColor}" stroke="#0b0e17" stroke-width="0.8"/>
+    </svg>`;
+}
+
+// 卡片缩略图悬停双轴数值提示
+function showSparkTooltip(e, sym) {
+  const d = latestDataMap[sym];
+  if (!d || !d.net_history || !d.net_history.points || d.net_history.points.length === 0) return;
+  const box = e.currentTarget;
+  const rect = box.getBoundingClientRect();
+  const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / Math.max(rect.width, 1)));
+  hoveredSpark = { sym, ratio, clientX: e.clientX, clientY: e.clientY };
+  renderSparkTooltipContent();
+}
+
+function renderSparkTooltipContent() {
+  if (!hoveredSpark) return;
+  const { sym, ratio, clientX, clientY } = hoveredSpark;
+  const d = latestDataMap[sym];
+  if (!d || !d.net_history || !d.net_history.points || !d.net_history.points.length) return;
+
+  const pts = d.net_history.points;
+  const idx = Math.min(pts.length - 1, Math.max(0, Math.round(ratio * (pts.length - 1))));
+  const pt = pts[idx];
+  const startV = d.net_history.start_val || pts[0].v;
+  const startP = d.net_history.start_spot || pts[0].p || d.spot;
+  const curP = pt.p || d.spot;
+  const dV = pt.v - startV;
+  const dP = curP - startP;
+  const divInfo = classifyDivergence(dV, dP);
+  const vCol = pt.v >= 0 ? "#34d399" : "#c084fc";
+
+  const tt = document.getElementById("tooltip");
+  tt.innerHTML = `
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+      <span style="font-weight:800; color:#38bdf8;">${sym} 走势对比 @ ${pt.t}</span>
+      <span style="font-size:10px; color:#94a3b8;">点击卡片放大 🔍</span>
+    </div>
+    <div>全链净 GEX: <b style="color:${vCol}">${formatGex(pt.v)}</b> <span style="font-size:11px; color:#94a3b8;">(较始 ${formatGexCompact(dV)})</span></div>
+    <div>${sym} 指数现价: <b style="color:#fbbf24">$${curP.toFixed(2)}</b> <span style="font-size:11px; color:#94a3b8;">(较始 ${formatSpotDelta(dP)})</span></div>
+    <div style="margin-top:4px; padding-top:4px; border-top:1px solid #334155; color:${divInfo.color}; font-weight:700;">
+      状态: ${divInfo.text}
+    </div>
+  `;
+  tt.style.display = "block";
+  tt.style.left = Math.min(clientX + 14, window.innerWidth - 340) + "px";
+  tt.style.top = Math.min(clientY + 14, window.innerHeight - 160) + "px";
+}
+
+function hideSparkTooltip() {
+  hoveredSpark = null;
+  document.getElementById("tooltip").style.display = "none";
+}
+
+function toggleInlineSpotLine() {
+  showInlineSpot = !showInlineSpot;
+  const btn = document.getElementById("spotLineBtn");
+  btn.innerText = showInlineSpot ? "📈 指数叠加: ON" : "📈 指数叠加: OFF";
+  btn.className = showInlineSpot ? "btn active-flow" : "btn";
+  renderDashboardFromLatest();
+}
+
+// ==================== 独立放大模态框核心渲染 ====================
+function openZoomModal(sym, ev) {
+  if (ev) ev.stopPropagation();
+  zoomedSym = sym;
+  zoomHoverIdx = null;
+  hideSparkTooltip();
+  document.getElementById("chartModal").classList.add("open");
+  renderZoomModal();
+}
+
+function closeZoomModal() {
+  zoomedSym = null;
+  zoomHoverIdx = null;
+  document.getElementById("chartModal").classList.remove("open");
+}
+
+function onModalMaskClick(e) {
+  if (e.target.id === "chartModal") closeZoomModal();
+}
+
+function toggleModalLayer(which) {
+  if (which === "gex") {
+    modalShowGex = !modalShowGex;
+    if (!modalShowGex && !modalShowSpot) modalShowSpot = true;
+  } else {
+    modalShowSpot = !modalShowSpot;
+    if (!modalShowGex && !modalShowSpot) modalShowGex = true;
+  }
+  const gBtn = document.getElementById("modalToggleGex");
+  const sBtn = document.getElementById("modalToggleSpot");
+  gBtn.className = modalShowGex ? "layer-toggle on-gex" : "layer-toggle";
+  gBtn.innerText = `${modalShowGex ? "✔" : "○"} 全链净 GEX (左轴)`;
+  sBtn.className = modalShowSpot ? "layer-toggle on-spot" : "layer-toggle";
+  sBtn.innerText = `${modalShowSpot ? "✔" : "○"} 指数现价线 (右轴)`;
+  renderZoomModal();
+}
+
+function onZoomChartHover(e) {
+  if (!zoomedSym || !latestDataMap[zoomedSym]) return;
+  const d = latestDataMap[zoomedSym];
+  const pts = (d.net_history && d.net_history.points) ? d.net_history.points : [];
+  if (pts.length === 0) return;
+
+  const wrap = document.getElementById("modalSvgWrap");
+  const rect = wrap.getBoundingClientRect();
+  const { W, PAD_L, PAD_R } = lastModalPlot;
+  const relX = (e.clientX - rect.left) / Math.max(rect.width, 1) * W;
+  const plotW = Math.max(1, W - PAD_L - PAD_R);
+  const ratio = Math.max(0, Math.min(1, (relX - PAD_L) / plotW));
+  zoomHoverIdx = Math.round(ratio * (pts.length - 1));
+  renderZoomModal();
+}
+
+function onZoomChartLeave() {
+  zoomHoverIdx = null;
+  renderZoomModal();
+}
+
+function renderZoomModal() {
+  if (!zoomedSym || !latestDataMap[zoomedSym]) return;
+  const d = latestDataMap[zoomedSym];
+  const nh = d.net_history || { points: [], start_val: d.total_net_gex, trend_delta: 0, start_spot: d.spot, spot_delta: 0, span_mins: 0 };
+  const pts = nh.points || [];
+
+  // 顶部标的快速切换标签
+  let tabsHtml = "";
+  for (const s of TICKER_ORDER) {
+    if (!latestDataMap[s]) continue;
+    const cls = s === zoomedSym ? "sym-tab active" : "sym-tab";
+    tabsHtml += `<button class="${cls}" onclick="openZoomModal('${s}')">${s}</button>`;
+  }
+  document.getElementById("modalSymTabs").innerHTML = tabsHtml;
+  document.getElementById("modalExpLabel").innerText = `${zoomedSym} (${d.exp}) · 全链净 GEX vs 指数现价双轴对比`;
+
+  const netGex = d.total_net_gex || 0;
+  const netCol = netGex >= 0 ? "#34d399" : "#c084fc";
+  const pctCol = d.pct_change >= 0 ? "#4ade80" : "#f87171";
+  const pctSign = d.pct_change >= 0 ? "+" : "";
+
+  const vals = pts.length ? pts.map(p => p.v) : [netGex];
+  const hiV = Math.max(...vals);
+  const loV = Math.min(...vals);
+  const { minV, maxV, minP, maxP, spots } = computeDualScales(pts, netGex, d.spot);
+
+  // KPI 指标栏
+  document.getElementById("modalKpiStrip").innerHTML = `
+    <div class="kpi-box">
+      <div class="kpi-lbl">当前全链净 GEX (${netGex >= 0 ? "正Gamma护盘" : "负Gamma助跌"})</div>
+      <div class="kpi-val" style="color:${netCol}">${formatGex(netGex)} <span style="font-size:11px; color:#94a3b8;">(${formatGexCompact(nh.trend_delta || 0)})</span></div>
+    </div>
+    <div class="kpi-box">
+      <div class="kpi-lbl">${zoomedSym} 实时指数现价</div>
+      <div class="kpi-val" style="color:#fbbf24">$${d.spot.toFixed(2)} <span style="font-size:11px; color:${pctCol};">${pctSign}${d.pct_change.toFixed(2)}%</span></div>
+    </div>
+    <div class="kpi-box">
+      <div class="kpi-lbl">采样区间极值 (GEX 低 / 高)</div>
+      <div class="kpi-val" style="color:#e2e8f0; font-size:13px;">${formatGexCompact(loV)} <span style="color:#64748b;">~</span> ${formatGexCompact(hiV)}</div>
+    </div>
+    <div class="kpi-box">
+      <div class="kpi-lbl">关键期权墙位 (Flip / Call / Put)</div>
+      <div class="kpi-val" style="font-size:12px; display:flex; gap:6px; margin-top:2px;">
+        <span style="color:#60a5fa">◆${d.zero_flip}</span>
+        <span style="color:#facc15">▲${d.call_wall}</span>
+        <span style="color:#c084fc">▼${d.put_wall}</span>
+      </div>
+    </div>
+  `;
+
+  // 当前检视点 (鼠标悬停点 或 最新实时点)
+  const activeIdx = (zoomHoverIdx !== null && pts.length > 0) ? Math.min(pts.length - 1, Math.max(0, zoomHoverIdx)) : (pts.length - 1);
+  const activePt = pts.length > 0 ? pts[activeIdx] : { t: "--:--", v: netGex, p: d.spot };
+  const startV = nh.start_val !== undefined ? nh.start_val : (pts[0] ? pts[0].v : netGex);
+  const startP = nh.start_spot || (spots[0] || d.spot);
+  const actSpot = (activePt.p && activePt.p > 0) ? activePt.p : d.spot;
+  const dV = activePt.v - startV;
+  const dP = actSpot - startP;
+  const dPct = startP > 0 ? (dP / startP * 100) : 0;
+  const divInfo = classifyDivergence(dV, dP);
+  const actVCol = activePt.v >= 0 ? "#34d399" : "#c084fc";
+
+  document.getElementById("modalReadoutBar").innerHTML = `
+    <div style="display:flex; flex-wrap:wrap; gap:16px; align-items:center;">
+      <span style="color:#94a3b8;">🕒 时刻: <b style="color:#f8fafc">${activePt.t}</b> ${zoomHoverIdx !== null ? "(十字回看)" : "(最新实时)"}</span>
+      <span>全链净 GEX: <b style="color:${actVCol}">${formatGex(activePt.v)}</b> <span style="color:#94a3b8; font-size:11px;">(区间变化 ${formatGexCompact(dV)})</span></span>
+      <span>${zoomedSym} 现价: <b style="color:#fbbf24">$${actSpot.toFixed(2)}</b> <span style="color:#94a3b8; font-size:11px;">(区间变化 ${formatSpotDelta(dP)} / ${dPct >= 0 ? "+" : ""}${dPct.toFixed(2)}%)</span></span>
+    </div>
+    <div style="color:${divInfo.color};">${divInfo.text}</div>
+  `;
+
+  const hud = d.hud || { text: "", color: "#38bdf8" };
+  const hudEl = document.getElementById("modalHudText");
+  hudEl.innerText = hud.text;
+  hudEl.style.color = hud.color;
+
+  // 自适应容器原生宽高绘制 1:1 无拉伸双轴大图 SVG
+  const wrap = document.getElementById("modalSvgWrap");
+  const W = Math.max(520, Math.round(wrap.clientWidth || 1000));
+  const H = Math.max(280, Math.round(wrap.clientHeight || 400));
+  const PAD_L = 74, PAD_R = 74, PAD_T = 20, PAD_B = 34;
+  lastModalPlot = { W, PAD_L, PAD_R };
+  const plotW = W - PAD_L - PAD_R;
+  const plotH = H - PAD_T - PAD_B;
+
+  if (pts.length === 0) {
+    wrap.innerHTML = `<div style="padding:80px; text-align:center; color:#64748b;">暂无采样点，等待后台同步...</div>`;
+    return;
+  }
+
+  const mapX = (i) => pts.length === 1 ? (PAD_L + plotW / 2) : (PAD_L + (i / (pts.length - 1)) * plotW);
+  const mapY_V = (v) => PAD_T + ((maxV - v) / (maxV - minV)) * plotH;
+  const mapY_P = (p) => PAD_T + ((maxP - p) / (maxP - minP)) * plotH;
+
+  // 水平网格线 & 左右双Y轴刻度 (5档)
+  let gridSvg = "";
+  const STEPS = 4;
+  for (let i = 0; i <= STEPS; i++) {
+    const frac = i / STEPS;
+    const y = (PAD_T + frac * plotH).toFixed(1);
+    const vTick = maxV - frac * (maxV - minV);
+    const pTick = maxP - frac * (maxP - minP);
+    const vTickCol = vTick >= 0 ? "#34d399" : "#c084fc";
+
+    gridSvg += `
+      <line x1="${PAD_L}" y1="${y}" x2="${W - PAD_R}" y2="${y}" stroke="#1e293b" stroke-width="1"/>
+      ${modalShowGex ? `<text x="${PAD_L - 8}" y="${Number(y) + 4}" text-anchor="end" fill="${vTickCol}" font-size="11" font-weight="700">${formatGexCompact(vTick)}</text>` : ""}
+      ${modalShowSpot ? `<text x="${W - PAD_R + 8}" y="${Number(y) + 4}" text-anchor="start" fill="#fbbf24" font-size="11" font-weight="700">$${pTick.toFixed(2)}</text>` : ""}
+    `;
+  }
+
+  // GEX 0轴分水岭线
+  const zeroY = Math.max(PAD_T, Math.min(PAD_T + plotH, mapY_V(0)));
+  const zeroPct = Math.max(0, Math.min(100, ((zeroY - PAD_T) / plotH) * 100)).toFixed(1);
+  if (minV <= 0 && maxV >= 0 && modalShowGex) {
+    gridSvg += `
+      <line x1="${PAD_L}" y1="${zeroY.toFixed(1)}" x2="${W - PAD_R}" y2="${zeroY.toFixed(1)}" stroke="#64748b" stroke-width="1.3" stroke-dasharray="5,4"/>
+      <text x="${PAD_L + 6}" y="${(zeroY - 5).toFixed(1)}" fill="#94a3b8" font-size="10" font-weight="700">GEX 0轴 (正负护盘分水岭)</text>
+    `;
+  }
+
+  // 若关键期权墙位 (Flip / Call Wall / Put Wall) 落在当前现价轴视野内，用淡色虚线标出参考位
+  if (modalShowSpot) {
+    const walls = [
+      { val: d.zero_flip, lbl: `◆Flip ${d.zero_flip}`, col: "#60a5fa" },
+      { val: d.call_wall, lbl: `▲CW ${d.call_wall}`, col: "#facc15" },
+      { val: d.put_wall,  lbl: `▼PW ${d.put_wall}`,  col: "#c084fc" },
+    ];
+    for (const w of walls) {
+      if (w.val >= minP && w.val <= maxP) {
+        const wy = mapY_P(w.val).toFixed(1);
+        gridSvg += `
+          <line x1="${PAD_L}" y1="${wy}" x2="${W - PAD_R}" y2="${wy}" stroke="${w.col}" stroke-opacity="0.35" stroke-width="1" stroke-dasharray="3,4"/>
+          <text x="${W - PAD_R - 6}" y="${(Number(wy) - 4).toFixed(1)}" text-anchor="end" fill="${w.col}" fill-opacity="0.8" font-size="10" font-weight="700">${w.lbl}</text>
+        `;
+      }
+    }
+  }
+
+  // X轴时间刻度 (最多6个均匀分布)
+  let xTicksSvg = "";
+  const tickCount = Math.min(6, pts.length);
+  for (let k = 0; k < tickCount; k++) {
+    const idx = tickCount === 1 ? 0 : Math.round((k / (tickCount - 1)) * (pts.length - 1));
+    const x = mapX(idx).toFixed(1);
+    xTicksSvg += `
+      <line x1="${x}" y1="${PAD_T + plotH}" x2="${x}" y2="${PAD_T + plotH + 5}" stroke="#475569" stroke-width="1"/>
+      <text x="${x}" y="${H - 10}" text-anchor="middle" fill="#94a3b8" font-size="11" font-weight="600">${pts[idx].t}</text>
+    `;
+  }
+
+  // 曲线路径构造
+  const gexCoords = pts.map((p, i) => [mapX(i), mapY_V(p.v)]);
+  const spotCoords = spots.map((sp, i) => [mapX(i), mapY_P(sp)]);
+
+  let gexLayerSvg = "";
+  if (modalShowGex) {
+    if (pts.length === 1) {
+      const cx = gexCoords[0][0].toFixed(1), cy = gexCoords[0][1].toFixed(1);
+      gexLayerSvg = `<circle cx="${cx}" cy="${cy}" r="5" fill="${netCol}"/>`;
+    } else {
+      const lineStr = gexCoords.map(c => `${c[0].toFixed(1)},${c[1].toFixed(1)}`).join(" ");
+      const firstX = gexCoords[0][0].toFixed(1);
+      const lastX = gexCoords[gexCoords.length - 1][0].toFixed(1);
+      const areaStr = `M ${firstX},${zeroY.toFixed(1)} L ` + gexCoords.map(c => `${c[0].toFixed(1)},${c[1].toFixed(1)}`).join(" L ") + ` L ${lastX},${zeroY.toFixed(1)} Z`;
+      gexLayerSvg = `
+        <path d="${areaStr}" fill="url(#modalFillGex)"/>
+        <polyline points="${lineStr}" fill="none" stroke="url(#modalStrokeGex)" stroke-width="2.6" stroke-linejoin="round" stroke-linecap="round"/>
+      `;
+    }
+  }
+
+  let spotLayerSvg = "";
+  if (modalShowSpot) {
+    if (spots.length === 1) {
+      const cx = spotCoords[0][0].toFixed(1), cy = spotCoords[0][1].toFixed(1);
+      spotLayerSvg = `<circle cx="${cx}" cy="${cy}" r="4.5" fill="#fbbf24"/>`;
+    } else {
+      const sLine = spotCoords.map(c => `${c[0].toFixed(1)},${c[1].toFixed(1)}`).join(" ");
+      spotLayerSvg = `
+        <polyline points="${sLine}" fill="none" stroke="rgba(11, 14, 23, 0.88)" stroke-width="4.4" stroke-linejoin="round" stroke-linecap="round"/>
+        <polyline points="${sLine}" fill="none" stroke="#fbbf24" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round"/>
+      `;
+    }
+  }
+
+  // 检视点十字准星与双轴高亮圆环
+  const actX = gexCoords[activeIdx][0].toFixed(1);
+  const actYV = gexCoords[activeIdx][1].toFixed(1);
+  const actYP = spotCoords[activeIdx][1].toFixed(1);
+  const crossSvg = `
+    <line x1="${actX}" y1="${PAD_T}" x2="${actX}" y2="${PAD_T + plotH}" stroke="#94a3b8" stroke-width="1.1" stroke-dasharray="4,3"/>
+    ${modalShowGex ? `
+      <line x1="${PAD_L}" y1="${actYV}" x2="${W - PAD_R}" y2="${actYV}" stroke="${actVCol}" stroke-opacity="0.35" stroke-width="1" stroke-dasharray="3,3"/>
+      <circle cx="${actX}" cy="${actYV}" r="5.2" fill="${actVCol}" stroke="#0b0e17" stroke-width="1.8"/>
+    ` : ""}
+    ${modalShowSpot ? `
+      <line x1="${PAD_L}" y1="${actYP}" x2="${W - PAD_R}" y2="${actYP}" stroke="#fbbf24" stroke-opacity="0.35" stroke-width="1" stroke-dasharray="3,3"/>
+      <circle cx="${actX}" cy="${actYP}" r="4.8" fill="#fbbf24" stroke="#0b0e17" stroke-width="1.8"/>
+    ` : ""}
+  `;
+
+  wrap.innerHTML = `
+    <svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}">
+      <defs>
+        <linearGradient id="modalStrokeGex" x1="0" y1="${PAD_T}" x2="0" y2="${PAD_T + plotH}" gradientUnits="userSpaceOnUse">
+          <stop offset="0%" stop-color="#34d399"/>
+          <stop offset="${zeroPct}%" stop-color="#34d399"/>
+          <stop offset="${zeroPct}%" stop-color="#c084fc"/>
+          <stop offset="100%" stop-color="#c084fc"/>
+        </linearGradient>
+        <linearGradient id="modalFillGex" x1="0" y1="${PAD_T}" x2="0" y2="${PAD_T + plotH}" gradientUnits="userSpaceOnUse">
           <stop offset="0%" stop-color="rgba(52, 211, 153, 0.30)"/>
           <stop offset="${zeroPct}%" stop-color="rgba(52, 211, 153, 0.04)"/>
           <stop offset="${zeroPct}%" stop-color="rgba(192, 132, 252, 0.04)"/>
           <stop offset="100%" stop-color="rgba(192, 132, 252, 0.32)"/>
         </linearGradient>
       </defs>
-      ${showZeroLine ? `<line x1="0" y1="${zeroY.toFixed(1)}" x2="${W}" y2="${zeroY.toFixed(1)}" stroke="#475569" stroke-width="0.9" stroke-dasharray="2,2"/>` : ""}
-      <path d="${areaPath}" fill="url(#${gradFillId})"/>
-      <polyline points="${linePoints}" fill="none" stroke="url(#${gradStrokeId})" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>
-      <circle cx="${lastX}" cy="${lastY}" r="2.7" fill="${dotColor}" stroke="#0b0e17" stroke-width="0.8"/>
-    </svg>`;
+      <rect x="${PAD_L}" y="${PAD_T}" width="${plotW}" height="${plotH}" fill="#0d121f" rx="4"/>
+      ${gridSvg}
+      ${xTicksSvg}
+      ${gexLayerSvg}
+      ${spotLayerSvg}
+      ${crossSvg}
+    </svg>
+  `;
 }
+
+// 窗口尺寸自适应与键盘快捷键支持 (ESC 关闭模态框，左右方向键切换放大标的)
+window.addEventListener("resize", () => {
+  if (zoomedSym) renderZoomModal();
+});
+
+document.addEventListener("keydown", (e) => {
+  if (!zoomedSym) return;
+  if (e.key === "Escape") {
+    closeZoomModal();
+  } else if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
+    const avail = TICKER_ORDER.filter(s => !!latestDataMap[s]);
+    if (avail.length > 1) {
+      const curIdx = avail.indexOf(zoomedSym);
+      const nextIdx = e.key === "ArrowRight"
+        ? (curIdx + 1) % avail.length
+        : (curIdx - 1 + avail.length) % avail.length;
+      openZoomModal(avail[nextIdx]);
+    }
+  }
+});
 
 function getRowStyle(gex, intensity) {
   if (gex >= 0) {
@@ -1763,6 +2461,7 @@ function renderTooltipContent(ticker, strike) {
 }
 
 function showTooltip(e, ticker, strike) {
+  hoveredSpark = null;
   hoveredKey = { ticker, strike };
   renderTooltipContent(ticker, strike);
   const tt = document.getElementById("tooltip");
@@ -1774,6 +2473,161 @@ function showTooltip(e, ticker, strike) {
 function hideTooltip() {
   hoveredKey = null;
   document.getElementById("tooltip").style.display = "none";
+}
+
+function renderDashboardFromLatest() {
+  const scrollPositions = {};
+  document.querySelectorAll(".ladder-body").forEach(el => {
+    const sym = el.getAttribute("data-sym");
+    if (sym) scrollPositions[sym] = el.scrollTop;
+  });
+
+  let html = "";
+  for (const sym of TICKER_ORDER) {
+    const d = latestDataMap[sym];
+    if (!d) continue;
+
+    const pctColor = d.pct_change >= 0 ? "#4ade80" : "#f87171";
+    const pctSign = d.pct_change >= 0 ? "+" : "";
+    const hud = d.hud || { text: "全链扫描中...", color: "#38bdf8" };
+
+    // 全链净值 + 指数现价双轴走势面板计算
+    const netGex = d.total_net_gex || 0;
+    const netColor = netGex >= 0 ? "#34d399" : "#c084fc";
+    const netModeLabel = netGex >= 0 ? "护盘" : "助跌";
+    const nh = d.net_history || { points: [], start_val: netGex, trend_delta: 0, start_spot: d.spot, spot_delta: 0, span_mins: 0 };
+    const tDelta = nh.trend_delta || 0;
+    const tDeltaColor = tDelta > 0 ? "#34d399" : (tDelta < 0 ? "#fb7185" : "#94a3b8");
+    const tArrow = tDelta > 0.001 ? "↗" : (tDelta < -0.001 ? "↘" : "→");
+    const spanTxt = nh.span_mins > 0 ? `近${nh.span_mins}m` : `实时(${nh.points.length}点)`;
+    const startTime = nh.points.length > 0 ? nh.points[0].t : "--:--";
+    const endTime = nh.points.length > 0 ? nh.points[nh.points.length - 1].t : "--:--";
+    const valsArr = nh.points.map(p => p.v);
+    const hiV = valsArr.length ? Math.max(...valsArr) : netGex;
+    const loV = valsArr.length ? Math.min(...valsArr) : netGex;
+    const sDelta = nh.spot_delta !== undefined
+      ? nh.spot_delta
+      : (nh.points.length > 0 && nh.points[0].p ? (d.spot - nh.points[0].p) : 0);
+    const sDeltaCol = sDelta > 0 ? "#fbbf24" : (sDelta < 0 ? "#fb7185" : "#94a3b8");
+    const sparkSvg = buildNetSparklineSVG(sym, nh, netGex, d.spot);
+    const threshLabel = formatGexCompact(d.delta_threshold || 0).replace("+", "");
+
+    let rowsHtml = "";
+    for (const r of d.rows) {
+      const style = getRowStyle(r.net_gex, r.intensity);
+      let rowCls = "strike-row";
+      if (r.is_spot) rowCls += " spot-row";
+      if (r.is_pinned) rowCls += " pinned-row";
+
+      const icons = [
+        r.is_pinned ? `<span class="pin-tag" title="超出当前视野的全链远端极值墙">📌远端</span>` : "",
+        r.is_spot ? `<span class="m-tag">M</span>` : "",
+        r.is_king ? "👑" : "",
+        r.is_call_wall ? "▲" : "",
+        r.is_put_wall ? "▼" : "",
+        r.is_flip ? "◆" : "",
+        r.tac_icon ? `<span class="tac-dot">${r.tac_icon}</span>` : ""
+      ].join(" ");
+      const star = r.is_star ? "*" : "";
+
+      let deltaHtml = "";
+      if (r.delta_sig >= 1 && Math.abs(r.delta_gex) > 0) {
+        const isUp = r.delta_gex > 0;
+        const badgeCls = isUp
+          ? (r.delta_sig >= 2 ? "delta-badge delta-up-2" : "delta-badge delta-up-1")
+          : (r.delta_sig >= 2 ? "delta-badge delta-dn-2" : "delta-badge delta-dn-1");
+        const prefix = r.delta_sig >= 2 ? "⚡" : (isUp ? "▲" : "▼");
+        deltaHtml = `<span class="${badgeCls}">${prefix}${formatGexCompact(r.delta_gex)}</span>`;
+      }
+
+      rowsHtml += `
+        <div class="${rowCls}" style="${style}"
+             onmousemove="showTooltip(event, '${sym}', ${r.strike})"
+             onmouseleave="hideTooltip()">
+          <div class="strike-left">
+            <span>${r.strike}</span>
+            <span>${icons}</span>
+          </div>
+          <div class="strike-mid">${deltaHtml}</div>
+          <div class="strike-right">${formatGex(r.net_gex)}${star}</div>
+        </div>
+      `;
+    }
+
+    html += `
+      <div class="col-card">
+        <div class="col-header">
+          <div class="title-row">
+            <span>${sym} (${d.exp})</span>
+            <span>
+              $${d.spot.toFixed(2)}
+              <span class="pct-tag" style="color:${pctColor}">${pctSign}${d.pct_change.toFixed(2)}%</span>
+            </span>
+          </div>
+          <div class="pills-row">
+            <div class="pills-left">
+              <span class="pill pill-flip">◆${d.zero_flip}</span>
+              <span class="pill pill-call">▲${d.call_wall}</span>
+              <span class="pill pill-put">▼${d.put_wall}</span>
+            </div>
+            <span class="thresh-pill" title="单档60秒变化超过该阈值才会在行内亮灯提醒">Δ≥${threshLabel}</span>
+          </div>
+          <div class="net-trend-box"
+               onclick="openZoomModal('${sym}', event)"
+               onmousemove="showSparkTooltip(event, '${sym}')"
+               onmouseleave="hideSparkTooltip()">
+            <div class="net-trend-top">
+              <span class="net-val-main" style="color:${netColor}">全链净 ${formatGex(netGex)} ${netModeLabel}</span>
+              <div class="net-top-right">
+                <span class="net-val-delta" style="color:${tDeltaColor}">${spanTxt} ${tArrow}${formatGexCompact(tDelta)}</span>
+                <button class="zoom-btn-mini" onclick="openZoomModal('${sym}', event)" title="单独放大查看 ${sym} 双轴走势图">🔍放大</button>
+              </div>
+            </div>
+            <div class="spark-legend-row">
+              <div class="legend-items">
+                <span><i class="legend-dot-gex" style="background:${netColor}"></i>净GEX</span>
+                ${showInlineSpot ? `<span><i class="legend-dot-spot"></i>${sym}现价</span>` : ""}
+              </div>
+              ${showInlineSpot ? `<span style="color:${sDeltaCol}; font-weight:700;">指数区间 ${formatSpotDelta(sDelta)}</span>` : ""}
+            </div>
+            <div class="spark-wrap">${sparkSvg}</div>
+            <div class="spark-meta">
+              <span>${startTime} 始:${formatGexCompact(nh.start_val)}</span>
+              <span>低:${formatGexCompact(loV)} / 高:${formatGexCompact(hiV)}</span>
+              <span>${endTime}</span>
+            </div>
+          </div>
+          <div class="tactical-hud" style="border-left-color:${hud.color}; color:${hud.color};">
+            ${hud.text}
+          </div>
+        </div>
+        <div class="ladder-body" data-sym="${sym}">${rowsHtml}</div>
+        <div class="col-footer">
+          <span>${formatGex(d.min_neg_val)}</span>
+          <span style="font-size:10px; color:#cbd5e1;">全链 MAX -GEX / +GEX</span>
+          <span>${formatGex(d.max_pos_val)}</span>
+        </div>
+      </div>
+    `;
+  }
+
+  if (html) {
+    document.getElementById("grid").innerHTML = html;
+    document.querySelectorAll(".ladder-body").forEach(el => {
+      const sym = el.getAttribute("data-sym");
+      if (sym && scrollPositions[sym] !== undefined) {
+        el.scrollTop = scrollPositions[sym];
+      }
+    });
+    if (hoveredKey) {
+      renderTooltipContent(hoveredKey.ticker, hoveredKey.strike);
+    } else if (hoveredSpark) {
+      renderSparkTooltipContent();
+    }
+  }
+  if (zoomedSym) {
+    renderZoomModal();
+  }
 }
 
 async function fetchGexData(force = false) {
@@ -1841,12 +2695,6 @@ async function fetchGexData(force = false) {
 
     latestDataMap = json.data || {};
 
-    const scrollPositions = {};
-    document.querySelectorAll(".ladder-body").forEach(el => {
-      const sym = el.getAttribute("data-sym");
-      if (sym) scrollPositions[sym] = el.scrollTop;
-    });
-
     const alertBox = document.getElementById("alertBox");
     const alertText = document.getElementById("alertText");
     if (json.alerts && json.alerts.length > 0) {
@@ -1855,133 +2703,7 @@ async function fetchGexData(force = false) {
       speakAlert(json.alerts[0]);
     }
 
-    const order = ["SPX", "XSP", "SPY", "QQQ"];
-    let html = "";
-
-    for (const sym of order) {
-      const d = json.data[sym];
-      if (!d) continue;
-
-      const pctColor = d.pct_change >= 0 ? "#4ade80" : "#f87171";
-      const pctSign = d.pct_change >= 0 ? "+" : "";
-      const hud = d.hud || { text: "全链扫描中...", color: "#38bdf8" };
-
-      // 全链净值走势面板计算
-      const netGex = d.total_net_gex || 0;
-      const netColor = netGex >= 0 ? "#34d399" : "#c084fc";
-      const netModeLabel = netGex >= 0 ? "护盘" : "助跌";
-      const nh = d.net_history || { points: [], start_val: netGex, trend_delta: 0, span_mins: 0 };
-      const tDelta = nh.trend_delta || 0;
-      const tDeltaColor = tDelta > 0 ? "#34d399" : (tDelta < 0 ? "#fb7185" : "#94a3b8");
-      const tArrow = tDelta > 0.001 ? "↗" : (tDelta < -0.001 ? "↘" : "→");
-      const spanTxt = nh.span_mins > 0 ? `近${nh.span_mins}m` : `实时(${nh.points.length}点)`;
-      const startTime = nh.points.length > 0 ? nh.points[0].t : "--:--";
-      const endTime = nh.points.length > 0 ? nh.points[nh.points.length - 1].t : "--:--";
-      const valsArr = nh.points.map(p => p.v);
-      const hiV = valsArr.length ? Math.max(...valsArr) : netGex;
-      const loV = valsArr.length ? Math.min(...valsArr) : netGex;
-      const sparkSvg = buildNetSparklineSVG(sym, nh, netGex);
-      const threshLabel = formatGexCompact(d.delta_threshold || 0).replace("+", "");
-
-      let rowsHtml = "";
-      for (const r of d.rows) {
-        const style = getRowStyle(r.net_gex, r.intensity);
-        let rowCls = "strike-row";
-        if (r.is_spot) rowCls += " spot-row";
-        if (r.is_pinned) rowCls += " pinned-row";
-
-        const icons = [
-          r.is_pinned ? `<span class="pin-tag" title="超出当前视野的全链远端极值墙">📌远端</span>` : "",
-          r.is_spot ? `<span class="m-tag">M</span>` : "",
-          r.is_king ? "👑" : "",
-          r.is_call_wall ? "▲" : "",
-          r.is_put_wall ? "▼" : "",
-          r.is_flip ? "◆" : "",
-          r.tac_icon ? `<span class="tac-dot">${r.tac_icon}</span>` : ""
-        ].join(" ");
-        const star = r.is_star ? "*" : "";
-
-        // 仅当变化数值达到显著阈值 (delta_sig >= 1) 时才在点数和 GEX 中间渲染异动胶囊
-        let deltaHtml = "";
-        if (r.delta_sig >= 1 && Math.abs(r.delta_gex) > 0) {
-          const isUp = r.delta_gex > 0;
-          const badgeCls = isUp
-            ? (r.delta_sig >= 2 ? "delta-badge delta-up-2" : "delta-badge delta-up-1")
-            : (r.delta_sig >= 2 ? "delta-badge delta-dn-2" : "delta-badge delta-dn-1");
-          const prefix = r.delta_sig >= 2 ? "⚡" : (isUp ? "▲" : "▼");
-          deltaHtml = `<span class="${badgeCls}">${prefix}${formatGexCompact(r.delta_gex)}</span>`;
-        }
-
-        rowsHtml += `
-          <div class="${rowCls}" style="${style}"
-               onmousemove="showTooltip(event, '${sym}', ${r.strike})"
-               onmouseleave="hideTooltip()">
-            <div class="strike-left">
-              <span>${r.strike}</span>
-              <span>${icons}</span>
-            </div>
-            <div class="strike-mid">${deltaHtml}</div>
-            <div class="strike-right">${formatGex(r.net_gex)}${star}</div>
-          </div>
-        `;
-      }
-
-      html += `
-        <div class="col-card">
-          <div class="col-header">
-            <div class="title-row">
-              <span>${sym} (${d.exp})</span>
-              <span>
-                $${d.spot.toFixed(2)}
-                <span class="pct-tag" style="color:${pctColor}">${pctSign}${d.pct_change.toFixed(2)}%</span>
-              </span>
-            </div>
-            <div class="pills-row">
-              <div class="pills-left">
-                <span class="pill pill-flip">◆${d.zero_flip}</span>
-                <span class="pill pill-call">▲${d.call_wall}</span>
-                <span class="pill pill-put">▼${d.put_wall}</span>
-              </div>
-              <span class="thresh-pill" title="单档60秒变化超过该阈值才会在行内亮灯提醒">Δ≥${threshLabel}</span>
-            </div>
-            <div class="net-trend-box" title="全链净GEX走势 | 区间最高: ${formatGex(hiV)} | 区间最低: ${formatGex(loV)}">
-              <div class="net-trend-top">
-                <span class="net-val-main" style="color:${netColor}">全链净 ${formatGex(netGex)} ${netModeLabel}</span>
-                <span class="net-val-delta" style="color:${tDeltaColor}">${spanTxt} ${tArrow}${formatGexCompact(tDelta)}</span>
-              </div>
-              <div class="spark-wrap">${sparkSvg}</div>
-              <div class="spark-meta">
-                <span>${startTime} 始:${formatGexCompact(nh.start_val)}</span>
-                <span>低:${formatGexCompact(loV)} / 高:${formatGexCompact(hiV)}</span>
-                <span>${endTime}</span>
-              </div>
-            </div>
-            <div class="tactical-hud" style="border-left-color:${hud.color}; color:${hud.color};">
-              ${hud.text}
-            </div>
-          </div>
-          <div class="ladder-body" data-sym="${sym}">${rowsHtml}</div>
-          <div class="col-footer">
-            <span>${formatGex(d.min_neg_val)}</span>
-            <span style="font-size:10px; color:#cbd5e1;">全链 MAX -GEX / +GEX</span>
-            <span>${formatGex(d.max_pos_val)}</span>
-          </div>
-        </div>
-      `;
-    }
-
-    if (html) {
-      document.getElementById("grid").innerHTML = html;
-      document.querySelectorAll(".ladder-body").forEach(el => {
-        const sym = el.getAttribute("data-sym");
-        if (sym && scrollPositions[sym] !== undefined) {
-          el.scrollTop = scrollPositions[sym];
-        }
-      });
-      if (hoveredKey) {
-        renderTooltipContent(hoveredKey.ticker, hoveredKey.strike);
-      }
-    }
+    renderDashboardFromLatest();
   } catch (err) {
     console.error("GEX refresh error:", err);
   } finally {
@@ -2008,7 +2730,7 @@ if __name__ == "__main__":
     kill_stale_port_5000(port)
     ensure_worker_started()
     print("=========================================================")
-    print(f"🚀 XSP/SPX GEX 指挥中心 (Carbon 趋势曲线 + 显著异动版) 已启动 (Port {port})")
+    print(f"🚀 XSP/SPX GEX 指挥中心 (双轴指数叠加 + 独立放大版) 已启动 (Port {port})")
     print(f"👉 本地访问: http://127.0.0.1:{port}")
     print("=========================================================")
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
